@@ -1,22 +1,19 @@
-# Weather A2A Agent Starter
+# Weather A2A Server
 
-This is a small public weather-agent starter you can deploy to a free host.
+This version exposes:
+- `/.well-known/agent-card.json`
+- `POST /` JSON-RPC
+- `POST /message/send` REST compatibility
+- `/health`
 
-## Endpoints
+Render settings:
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 
-- `/.well-known/agent-card.json` — A2A agent card
-- `/weather?city=London` — current weather lookup
-- `/health` — simple health check
+After deploy, set:
+- `PUBLIC_BASE_URL=https://<your-service>.onrender.com`
 
-## Deploy on Render
-
-1. Create a new GitHub repo and add these files.
-2. Create a new Render Web Service from that repo.
-3. Use:
-   - Build command: `pip install -r requirements.txt`
-   - Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Set `PUBLIC_BASE_URL` to your Render URL once the service is created.
-5. Your public Agent Card will be at:
-   `https://YOUR-SERVICE.onrender.com/.well-known/agent-card.json`
-
-Render documents free web services and static sites, and its quickstart says no payment is required for the first deploy flow. Cloudflare Workers also has a Free plan if you prefer edge hosting.
+Test:
+- `curl https://<your-service>.onrender.com/.well-known/agent-card.json`
+- send your A2A client's JSON-RPC request to `POST /`
+- send v0.3-style REST calls to `POST /message/send`
