@@ -1,23 +1,126 @@
-# Weather A2A Agent
+# A2A Basic Auth Interop Agent
 
-This version fixes the card so it advertises the public Render host automatically.
-It also accepts:
-- `POST /`
-- `POST /message:send`
-- `POST /message/send`
-- `POST /message:stream`
-- `POST /message/stream`
+A small FastAPI A2A test agent with a public Agent Card, Basic-auth protected invocation, and three deterministic skills.
 
-## Render
-Build command:
-`pip install -r requirements.txt`
+## Endpoints
 
-Start command:
-`uvicorn main:app --host 0.0.0.0 --port $PORT`
+- `GET /health`
+- `GET /.well-known/agent-card.json`
+- `POST /` for JSON-RPC `message/send`
+- `POST /message:send` for HTTP+JSON style `SendMessageRequest`
 
-## Test
-Card:
-`https://YOUR-SERVICE.onrender.com/.well-known/agent-card.json`
+The Agent Card and health endpoint are public. Invoke endpoints require HTTP Basic auth.
 
-Invoke:
-`curl -X POST https://YOUR-SERVICE.onrender.com/message:send -H 'Content-Type: application/json' -d '{"message":{"parts":[{"text":"weather in Bengaluru"}]}}'`
+## Skills
+
+- `weather_lookup`: deterministic weather for Bengaluru, Tokyo, and Chicago.
+- `calculator`: evaluates simple arithmetic using `+`, `-`, `*`, `/`, and parentheses.
+- `text_transform`: uppercase, lowercase, title case, or reverse.
+
+## Local Run
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export A2A_BASIC_USERNAME=a2a_user
+export A2A_BASIC_PASSWORD=Welcome1
+export PUBLIC_BASE_URL=http://localhost:8080
+uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+## Render Deployment
+
+Create a Render Web Service from the repository containing these files.
+
+- Runtime: Python 3
+- Build command: `pip install -r requirements.txt`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Health check path: `/health`
+
+Set environment variables:
+
+```text
+PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
+A2A_BASIC_USERNAME=<your-user>
+A2A_BASIC_PASSWORD=<your-password>
+```
+
+## Curl Tests
+
+Fetch the public Agent Card:
+
+```bash
+curl 'https://<your-render-service>.onrender.com/.well-known/agent-card.json'
+```
+
+Verify invoke requires auth:
+
+```bash
+curl -i -X POST 'https://<your-render-service>.onrender.com/' \
+  --header 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}}'
+```
+
+Call the weather skill:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/' \
+  --user '<your-user>:<your-password>' \
+  --header 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"metadata":{"skillId":"weather_lookup"},"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}}'
+```
+
+Call the calculator skill:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/' \
+  --user '<your-user>:<your-password>' \
+  --header 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":"2","method":"message/send","params":{"metadata":{"skillId":"calculator"},"message":{"messageId":"m-2","role":"ROLE_USER","parts":[{"text":"calculate 12 * (4 + 2)"}]}}}'
+```
+
+Call the text transform skill:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/' \
+  --user '<your-user>:<your-password>' \
+  --header 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","id":"3","method":"message/send","params":{"metadata":{"skillId":"text_transform"},"message":{"messageId":"m-3","role":"ROLE_USER","parts":[{"text":"uppercase hello agent"}]}}}'
+```
+
+## Connector Gateway Notes
+
+The Agent Card advertises Basic auth through `securitySchemes` and `securityRequirements`.
+
+Runtime metadata should map this to an auth profile similar to:
+
+```json
+{
+  "id": "basic_profile",
+  "displayName": "Basic Authentication",
+  "authType": "basic",
+  "tokenSource": "stored",
+  "inputBindings": {
+    "username": "${authentication.username}",
+    "password": "${authentication.password}"
+  }
+}
+```
+
+Store the actual values in connector config or vault:
+
+```json
+{
+  "service": {
+    "baseUrl": "https://<your-render-service>.onrender.com"
+  },
+  "authentication": {
+    "selectedAuthProfile": "basic_profile",
+    "username": "<your-user>",
+    "password": "<your-password>"
+  }
+}
+```
+
+Do not store the username/password in the Agent Card or connector runtime metadata.

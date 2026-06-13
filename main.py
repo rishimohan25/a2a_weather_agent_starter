@@ -1,128 +1,75 @@
-import json
+from __future__ import annotations
+
+import ast
+import operator
 import os
 import re
-from typing import Any, Dict, Optional
+import secrets
+from typing import Any, Callable, Dict, Optional
+from uuid import uuid4
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-
-APP_NAME = "Weather A2A Agent"
-APP_VERSION = "1.0.1"
-
-app = FastAPI(title=APP_NAME)
-
-WEATHER_CODES = {
-    0: "Clear sky",
-    1: "Mainly clear",
-    2: "Partly cloudy",
-    3: "Overcast",
-    45: "Fog",
-    48: "Depositing rime fog",
-    51: "Light drizzle",
-    53: "Moderate drizzle",
-    55: "Dense drizzle",
-    61: "Slight rain",
-    63: "Moderate rain",
-    65: "Heavy rain",
-    71: "Slight snow",
-    73: "Moderate snow",
-    75: "Heavy snow",
-    80: "Rain showers",
-    81: "Moderate rain showers",
-    82: "Violent rain showers",
-    95: "Thunderstorm",
-}
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 
-def _public_base_url(request: Request) -> str:
-    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-    if not host:
-        return str(request.base_url).rstrip("/")
-    return f"{proto}://{host}".rstrip("/")
+APP_NAME = "A2A Basic Auth Interop Agent"
+APP_VERSION = "1.0.0"
+DEFAULT_USERNAME = "a2a_user"
+DEFAULT_PASSWORD = "Welcome1"
+
+security = HTTPBasic(auto_error=False)
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
 
-def _extract_city(text: str) -> Optional[str]:
-    if not text:
-        return None
-
-    patterns = [
-        r"weather in ([A-Za-z][A-Za-z\s,.\-']{1,80})",
-        r"forecast for ([A-Za-z][A-Za-z\s,.\-']{1,80})",
-        r"in ([A-Za-z][A-Za-z\s,.\-']{1,80})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            city = match.group(1).strip(" ?!.,")
-            if city:
-                return city
-    return None
+def configured_username() -> str:
+    return os.getenv("A2A_BASIC_USERNAME", DEFAULT_USERNAME)
 
 
-def _weather_code_text(code: Any) -> str:
-    try:
-        return WEATHER_CODES.get(int(code), f"Weather code {code}")
-    except Exception:
-        return f"Weather code {code}"
+def configured_password() -> str:
+    return os.getenv("A2A_BASIC_PASSWORD", DEFAULT_PASSWORD)
 
 
-async def _lookup_weather(city: str) -> str:
-    async with httpx.AsyncClient(timeout=20) as client:
-        geo = await client.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": city, "count": 1, "language": "en", "format": "json"},
-        )
-        geo.raise_for_status()
-        geo_data = geo.json()
-        results = geo_data.get("results") or []
-        if not results:
-            return f"I could not find a city named '{city}'."
+def public_base_url() -> str:
+    configured = os.getenv("PUBLIC_BASE_URL")
+    if configured:
+        return configured.rstrip("/")
+    return "http://localhost:%s" % os.getenv("PORT", "8080")
 
-        place = results[0]
-        lat = place["latitude"]
-        lon = place["longitude"]
 
-        forecast = await client.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": lat,
-                "longitude": lon,
-                "current": "temperature_2m,wind_speed_10m,weather_code",
-                "daily": "temperature_2m_max,temperature_2m_min,weather_code",
-                "timezone": "auto",
-            },
-        )
-        forecast.raise_for_status()
-        forecast_data = forecast.json()
-
-    current = forecast_data.get("current", {})
-    daily = forecast_data.get("daily", {})
-
-    temp = current.get("temperature_2m", "unknown")
-    wind = current.get("wind_speed_10m", "unknown")
-    current_text = _weather_code_text(current.get("weather_code"))
-
-    day_max = (daily.get("temperature_2m_max") or [None])[0]
-    day_min = (daily.get("temperature_2m_min") or [None])[0]
-    daily_text = _weather_code_text((daily.get("weather_code") or [None])[0])
-
-    return (
-        f"{place.get('name')}, {place.get('country')}: "
-        f"now {temp}°C, {current_text}, wind {wind} km/h. "
-        f"Today: high {day_max}°C, low {day_min}°C, {daily_text}."
+def require_basic_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> str:
+    if credentials is not None:
+        valid_username = secrets.compare_digest(credentials.username, configured_username())
+        valid_password = secrets.compare_digest(credentials.password, configured_password())
+        if valid_username and valid_password:
+            return credentials.username
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Basic authentication required",
+        headers={"WWW-Authenticate": "Basic"},
     )
 
 
-def _agent_card(request: Request) -> Dict[str, Any]:
-    base_url = _public_base_url(request)
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok", "agent": APP_NAME, "version": APP_VERSION}
+
+
+@app.get("/.well-known/agent-card.json")
+def agent_card() -> Dict[str, Any]:
+    base_url = public_base_url()
+    security_requirement = {"schemes": {"basic_auth": {"list": []}}}
     return {
         "name": APP_NAME,
-        "description": "A tiny weather agent for A2A interoperability testing.",
+        "description": "A deterministic A2A test agent with multiple skills and HTTP Basic authentication.",
         "version": APP_VERSION,
+        "provider": {
+            "organization": "A2A Connector POC",
+            "url": base_url,
+        },
         "capabilities": {
             "streaming": False,
+            "pushNotifications": False,
             "extendedAgentCard": False,
         },
         "defaultInputModes": ["text/plain", "application/json"],
@@ -132,146 +79,286 @@ def _agent_card(request: Request) -> Dict[str, Any]:
                 "url": base_url,
                 "protocolBinding": "JSONRPC",
                 "protocolVersion": "1.0",
-            }
+            },
+            {
+                "url": base_url + "/message:send",
+                "protocolBinding": "HTTP+JSON",
+                "protocolVersion": "1.0",
+            },
         ],
+        "securitySchemes": {
+            "basic_auth": {
+                "httpAuthSecurityScheme": {
+                    "description": "HTTP Basic authentication for A2A invocation endpoints.",
+                    "scheme": "Basic",
+                }
+            }
+        },
+        "securityRequirements": [security_requirement],
         "skills": [
             {
                 "id": "weather_lookup",
                 "name": "Weather Lookup",
-                "description": "Returns current weather and a short forecast for a city.",
+                "description": "Returns deterministic current weather and forecast text for supported cities.",
                 "tags": ["weather", "forecast", "temperature"],
-                "examples": ["weather in Bengaluru", "forecast for Tokyo"],
+                "examples": ["weather in Bengaluru", "forecast for Tokyo", "weather in Chicago"],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
-            }
+                "securityRequirements": [security_requirement],
+            },
+            {
+                "id": "calculator",
+                "name": "Calculator",
+                "description": "Evaluates simple arithmetic using +, -, *, /, and parentheses.",
+                "tags": ["calculator", "math", "arithmetic"],
+                "examples": ["calculate 12 * (4 + 2)", "what is 144 / 12?"],
+                "inputModes": ["text/plain", "application/json"],
+                "outputModes": ["text/plain", "application/json"],
+                "securityRequirements": [security_requirement],
+            },
+            {
+                "id": "text_transform",
+                "name": "Text Transform",
+                "description": "Transforms text to uppercase, lowercase, title case, or reverse order.",
+                "tags": ["text", "transform", "formatting"],
+                "examples": ["uppercase hello agent", "reverse connector", "title case agent to agent"],
+                "inputModes": ["text/plain", "application/json"],
+                "outputModes": ["text/plain", "application/json"],
+                "securityRequirements": [security_requirement],
+            },
         ],
     }
 
 
-def _extract_text_from_body(body: Any) -> str:
-    if isinstance(body, dict):
-        if isinstance(body.get("message"), dict):
-            message = body["message"]
-            if isinstance(message.get("parts"), list):
-                texts = []
-                for part in message["parts"]:
-                    if isinstance(part, dict) and isinstance(part.get("text"), str):
-                        texts.append(part["text"])
-                if texts:
-                    return "\n".join(texts)
-            for key in ("text", "content", "query", "prompt"):
-                if isinstance(message.get(key), str):
-                    return message[key]
-
-        if isinstance(body.get("params"), dict):
-            params = body["params"]
-            if isinstance(params.get("message"), dict):
-                nested = _extract_text_from_body({"message": params["message"]})
-                if nested:
-                    return nested
-            for key in ("text", "content", "query", "prompt"):
-                if isinstance(params.get(key), str):
-                    return params[key]
-
-        for key in ("text", "content", "query", "prompt"):
-            if isinstance(body.get(key), str):
-                return body[key]
-
-    return ""
-
-
-async def _build_reply(text: str) -> str:
-    city = _extract_city(text)
-    if not city:
-        return "Tell me a city, for example: 'weather in Bengaluru' or 'forecast for Tokyo'."
-    return await _lookup_weather(city)
-
-
-def _jsonrpc_response(request_id: Any, reply_text: str) -> Dict[str, Any]:
-    return {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "result": {
-            "message": {
-                "role": "ROLE_AGENT",
-                "parts": [
-                    {
-                        "text": reply_text
-                    }
-                ]
-            }
-        }
-    }
-
-
-def _rest_response(reply_text: str) -> Dict[str, Any]:
-    return {
-        "message": {
-            "role": "ROLE_AGENT",
-            "parts": [
-                {
-                    "text": reply_text
-                }
-            ]
-        }
-    }
-
-
-@app.get("/", response_class=PlainTextResponse)
-async def root() -> str:
-    return (
-        f"{APP_NAME} is running. "
-        "Use /.well-known/agent-card.json for discovery, "
-        "POST / for JSON-RPC, or POST /message:send / POST /message/send for invoke testing."
-    )
-
-
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    return {"ok": True}
-
-
-@app.get("/.well-known/agent-card.json")
-async def agent_card(request: Request) -> JSONResponse:
-    return JSONResponse(_agent_card(request))
-
-
-async def _handle_invoke(request: Request) -> JSONResponse:
-    body: Any = None
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-
-    text = _extract_text_from_body(body) if isinstance(body, dict) else ""
-    reply = await _build_reply(text)
-
-    is_jsonrpc = isinstance(body, dict) and body.get("jsonrpc") == "2.0" and "id" in body
-    if is_jsonrpc:
-        return JSONResponse(_jsonrpc_response(body.get("id"), reply))
-    return JSONResponse(_rest_response(reply))
-
-
 @app.post("/")
-async def post_root(request: Request) -> JSONResponse:
-    return await _handle_invoke(request)
+async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth)) -> JSONResponse:
+    payload = await request.json()
+    request_id = payload.get("id")
+    if payload.get("jsonrpc") != "2.0":
+        return jsonrpc_error(request_id, -32600, "Invalid JSON-RPC request")
+    if payload.get("method") != "message/send":
+        return jsonrpc_error(request_id, -32601, "Method not found")
+    try:
+        result = handle_send_message(payload.get("params") or {})
+        return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+    except Exception as exc:
+        return jsonrpc_error(request_id, -32000, str(exc))
 
 
 @app.post("/message:send")
-async def message_send_colon(request: Request) -> JSONResponse:
-    return await _handle_invoke(request)
+async def http_json_send_message(request: Request, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+    payload = await request.json()
+    return handle_send_message(payload)
 
 
-@app.post("/message/send")
-async def message_send_slash(request: Request) -> JSONResponse:
-    return await _handle_invoke(request)
+def jsonrpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
+    return JSONResponse(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        }
+    )
 
 
-@app.post("/message:stream")
-async def message_stream_colon(request: Request) -> JSONResponse:
-    return await _handle_invoke(request)
+def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
+    message = payload.get("message") or {}
+    text = extract_text(message)
+    metadata = merge_metadata(payload.get("metadata"), message.get("metadata"))
+    skill_id = resolve_skill_id(text, metadata)
+    response_text = dispatch_skill(skill_id, text, metadata)
+    return {"message": response_message(response_text, message)}
 
 
-@app.post("/message/stream")
-async def message_stream_slash(request: Request) -> JSONResponse:
-    return await _handle_invoke(request)
+def extract_text(message: Dict[str, Any]) -> str:
+    parts = message.get("parts") or []
+    values = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if isinstance(part.get("text"), str):
+            values.append(part["text"])
+        elif isinstance(part.get("data"), (dict, list, str, int, float, bool)):
+            values.append(str(part["data"]))
+    return " ".join(values).strip()
+
+
+def merge_metadata(*items: Any) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for item in items:
+        if isinstance(item, dict):
+            merged.update(item)
+    return merged
+
+
+def resolve_skill_id(text: str, metadata: Dict[str, Any]) -> str:
+    requested = str(metadata.get("skillId") or metadata.get("skill_id") or "").strip().lower()
+    aliases = {
+        "weather": "weather_lookup",
+        "weather_lookup": "weather_lookup",
+        "calculator": "calculator",
+        "calculate": "calculator",
+        "math": "calculator",
+        "text": "text_transform",
+        "text_transform": "text_transform",
+        "transform": "text_transform",
+    }
+    if requested in aliases:
+        return aliases[requested]
+
+    lowered = text.lower()
+    if any(word in lowered for word in ("weather", "forecast", "temperature")):
+        return "weather_lookup"
+    if any(word in lowered for word in ("uppercase", "lowercase", "title case", "reverse", "transform")):
+        return "text_transform"
+    if looks_like_calculation(lowered):
+        return "calculator"
+    return "help"
+
+
+def dispatch_skill(skill_id: str, text: str, metadata: Dict[str, Any]) -> str:
+    if skill_id == "weather_lookup":
+        return weather_lookup(text, metadata)
+    if skill_id == "calculator":
+        return calculator(text, metadata)
+    if skill_id == "text_transform":
+        return text_transform(text, metadata)
+    return (
+        "I can run weather_lookup, calculator, or text_transform. "
+        "Try 'weather in Bengaluru', 'calculate 12 * (4 + 2)', or 'uppercase hello agent'."
+    )
+
+
+def response_message(text: str, request_message: Dict[str, Any]) -> Dict[str, Any]:
+    response: Dict[str, Any] = {
+        "messageId": str(uuid4()),
+        "role": "ROLE_AGENT",
+        "parts": [{"text": text, "mediaType": "text/plain"}],
+    }
+    context_id = request_message.get("contextId") or request_message.get("context_id")
+    task_id = request_message.get("taskId") or request_message.get("task_id")
+    if context_id:
+        response["contextId"] = context_id
+    if task_id:
+        response["taskId"] = task_id
+    return response
+
+
+def weather_lookup(text: str, metadata: Dict[str, Any]) -> str:
+    requested_city = str(metadata.get("city") or "").strip()
+    lowered = (requested_city or text).lower()
+    forecasts = {
+        "bengaluru": "Bengaluru, India: now 24.0 C, partly cloudy, wind 11 km/h. Today: high 30 C, low 21 C, scattered showers.",
+        "bangalore": "Bengaluru, India: now 24.0 C, partly cloudy, wind 11 km/h. Today: high 30 C, low 21 C, scattered showers.",
+        "tokyo": "Tokyo, Japan: now 27.0 C, humid, wind 9 km/h. Today: high 31 C, low 24 C, light rain late evening.",
+        "chicago": "Chicago, USA: now 18.0 C, clear, wind 16 km/h. Today: high 23 C, low 14 C, dry and breezy.",
+    }
+    for city, forecast in forecasts.items():
+        if city in lowered:
+            return forecast
+    return "Tell me a supported city, for example: 'weather in Bengaluru', 'forecast for Tokyo', or 'weather in Chicago'."
+
+
+def looks_like_calculation(text: str) -> bool:
+    return bool(re.search(r"\d", text) and re.search(r"[+\-*/()]", text))
+
+
+def calculator(text: str, metadata: Dict[str, Any]) -> str:
+    expression = str(metadata.get("expression") or "").strip() or extract_expression(text)
+    if not expression:
+        return "Send a simple arithmetic expression, for example: 'calculate 12 * (4 + 2)'."
+    try:
+        result = evaluate_expression(expression)
+    except ZeroDivisionError:
+        return "Cannot divide by zero."
+    except Exception:
+        return "I can only evaluate numbers with +, -, *, /, and parentheses."
+    return "%s = %s" % (expression, format_number(result))
+
+
+def extract_expression(text: str) -> str:
+    candidate = re.sub(r"(?i)\b(calculate|compute|what is|what's|math|please)\b", " ", text)
+    candidate = candidate.strip(" ?:=\t\n")
+    allowed = "".join(ch for ch in candidate if ch.isdigit() or ch in " +-*/().")
+    return re.sub(r"\s+", " ", allowed).strip()
+
+
+ALLOWED_BINARY_OPERATORS: Dict[type, Callable[[float, float], float]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+
+ALLOWED_UNARY_OPERATORS: Dict[type, Callable[[float], float]] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+
+
+def evaluate_expression(expression: str) -> float:
+    parsed = ast.parse(expression, mode="eval")
+    return evaluate_node(parsed.body)
+
+
+def evaluate_node(node: ast.AST) -> float:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_BINARY_OPERATORS:
+        return ALLOWED_BINARY_OPERATORS[type(node.op)](evaluate_node(node.left), evaluate_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_UNARY_OPERATORS:
+        return ALLOWED_UNARY_OPERATORS[type(node.op)](evaluate_node(node.operand))
+    raise ValueError("unsupported expression")
+
+
+def format_number(value: float) -> str:
+    if value.is_integer():
+        return str(int(value))
+    return ("%.6f" % value).rstrip("0").rstrip(".")
+
+
+def text_transform(text: str, metadata: Dict[str, Any]) -> str:
+    operation = str(metadata.get("operation") or "").strip().lower()
+    content = str(metadata.get("text") or metadata.get("value") or "").strip()
+    if not operation:
+        operation = infer_text_operation(text)
+    if not content:
+        content = extract_transform_content(text, operation)
+    if not content:
+        return "Send text to transform, for example: 'uppercase hello agent' or 'reverse connector'."
+
+    if operation in ("uppercase", "upper"):
+        return content.upper()
+    if operation in ("lowercase", "lower"):
+        return content.lower()
+    if operation in ("title", "titlecase", "title case"):
+        return content.title()
+    if operation == "reverse":
+        return content[::-1]
+    return "Supported text operations are uppercase, lowercase, title case, and reverse."
+
+
+def infer_text_operation(text: str) -> str:
+    lowered = text.lower()
+    if "uppercase" in lowered or re.search(r"\bupper\b", lowered):
+        return "uppercase"
+    if "lowercase" in lowered or re.search(r"\blower\b", lowered):
+        return "lowercase"
+    if "title case" in lowered or re.search(r"\btitle\b", lowered):
+        return "title"
+    if "reverse" in lowered:
+        return "reverse"
+    return ""
+
+
+def extract_transform_content(text: str, operation: str) -> str:
+    if ":" in text:
+        return text.split(":", 1)[1].strip()
+    content = text
+    for phrase in ("uppercase", "lowercase", "title case", "titlecase", "reverse", "transform", operation):
+        if phrase:
+            content = re.sub(re.escape(phrase), " ", content, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", content).strip(" ?:=\t\n")

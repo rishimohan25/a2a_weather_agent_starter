@@ -1,7 +1,15 @@
 services:
   - type: web
-    name: a2a-weather-agent
+    name: a2a-basic-auth-agent
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: A2A_BASIC_USERNAME
+        value: a2a_user
+      - key: A2A_BASIC_PASSWORD
+        sync: false
