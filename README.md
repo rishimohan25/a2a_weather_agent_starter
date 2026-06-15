@@ -49,8 +49,8 @@ Set environment variables:
 PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
 GOOGLE_API_KEY=<your-google-api-key>
 GEMINI_MODEL=gemini-3.5-flash
-A2A_BASIC_USERNAME=rismohan
-A2A_BASIC_PASSWORD=Welcome@123
+A2A_BASIC_USERNAME=test
+A2A_BASIC_PASSWORD=password
 ```
 
 Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
@@ -91,17 +91,17 @@ Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
-  --user 'rismohan:Welcome@123'
+  --user 'test:pasword'
 ```
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
-  --user 'rismohan:Welcome@123'
+  --user 'test:pasword'
 ```
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user 'test:pasword' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -119,7 +119,7 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
-  --user 'rismohan:Welcome@123'
+  --user 'test:pasword'
 ```
 
 ## Gateway Test Flow
@@ -143,8 +143,8 @@ Store auth in connector config or vault:
   },
   "authentication": {
     "selectedAuthProfile": "basic_profile",
-    "username": "rismohan",
-    "password": "Welcome@123"
+    "username": "",
+    "password": ""
   }
 }
 ```
