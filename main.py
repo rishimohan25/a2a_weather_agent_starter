@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-import ast
-import operator
 import os
-import re
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from google import genai
 
 
-APP_NAME = "A2A Basic Auth Interop Agent"
+APP_NAME = "A2A Gemini LLM Agent"
 APP_VERSION = "1.0.0"
 DEFAULT_USERNAME = "a2a_user"
 DEFAULT_PASSWORD = "Welcome1"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 security = HTTPBasic(auto_error=False)
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -30,6 +29,14 @@ def configured_username() -> str:
 
 def configured_password() -> str:
     return os.getenv("A2A_BASIC_PASSWORD", DEFAULT_PASSWORD)
+
+
+def configured_model() -> str:
+    return os.getenv("GEMINI_MODEL", DEFAULT_MODEL)
+
+
+def configured_google_api_key() -> Optional[str]:
+    return os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 
 def public_base_url() -> str:
@@ -53,8 +60,14 @@ def require_basic_auth(credentials: Optional[HTTPBasicCredentials] = Depends(sec
 
 
 @app.get("/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "agent": APP_NAME, "version": APP_VERSION}
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "agent": APP_NAME,
+        "version": APP_VERSION,
+        "model": configured_model(),
+        "googleApiKeyConfigured": bool(configured_google_api_key()),
+    }
 
 
 @app.get("/.well-known/agent-card.json")
@@ -63,7 +76,7 @@ def agent_card() -> Dict[str, Any]:
     security_requirement = {"schemes": {"basic_auth": {"list": []}}}
     return {
         "name": APP_NAME,
-        "description": "A deterministic A2A test agent with multiple skills and HTTP Basic authentication.",
+        "description": "A stateful A2A test agent backed by Google Gemini and HTTP Basic authentication.",
         "version": APP_VERSION,
         "provider": {
             "organization": "A2A Connector POC",
@@ -92,7 +105,7 @@ def agent_card() -> Dict[str, Any]:
         "securitySchemes": {
             "basic_auth": {
                 "httpAuthSecurityScheme": {
-                    "description": "HTTP Basic authentication for A2A invocation endpoints.",
+                    "description": "HTTP Basic authentication for A2A invocation and task endpoints.",
                     "scheme": "Basic",
                 }
             }
@@ -100,31 +113,40 @@ def agent_card() -> Dict[str, Any]:
         "securityRequirements": [security_requirement],
         "skills": [
             {
-                "id": "weather_lookup",
-                "name": "Weather Lookup",
-                "description": "Returns deterministic current weather and forecast text for supported cities.",
-                "tags": ["weather", "forecast", "temperature"],
-                "examples": ["weather in Bengaluru", "forecast for Tokyo", "weather in Chicago"],
+                "id": "llm_chat",
+                "name": "LLM Chat",
+                "description": "Uses Gemini to answer general user requests.",
+                "tags": ["llm", "chat", "gemini"],
+                "examples": [
+                    "Explain A2A task state in two sentences.",
+                    "Write a short support reply for a delayed delivery.",
+                ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
                 "securityRequirements": [security_requirement],
             },
             {
-                "id": "calculator",
-                "name": "Calculator",
-                "description": "Evaluates simple arithmetic using +, -, *, /, and parentheses.",
-                "tags": ["calculator", "math", "arithmetic"],
-                "examples": ["calculate 12 * (4 + 2)", "what is 144 / 12?"],
+                "id": "llm_summarize",
+                "name": "LLM Summarize",
+                "description": "Uses Gemini to summarize text into concise bullets.",
+                "tags": ["llm", "summary", "gemini"],
+                "examples": [
+                    "Summarize: The customer reported delayed delivery and asked for refund options.",
+                    "Summarize this incident update in three bullets.",
+                ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
                 "securityRequirements": [security_requirement],
             },
             {
-                "id": "text_transform",
-                "name": "Text Transform",
-                "description": "Transforms text to uppercase, lowercase, title case, or reverse order.",
-                "tags": ["text", "transform", "formatting"],
-                "examples": ["uppercase hello agent", "reverse connector", "title case agent to agent"],
+                "id": "llm_extract_actions",
+                "name": "LLM Extract Actions",
+                "description": "Uses Gemini to extract action items, owners, and dates from text.",
+                "tags": ["llm", "actions", "gemini"],
+                "examples": [
+                    "Extract actions from: Rishi will update metadata by Friday.",
+                    "Find follow-up tasks in this meeting note.",
+                ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
                 "securityRequirements": [security_requirement],
@@ -144,6 +166,8 @@ async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth))
     try:
         result = handle_send_message(payload.get("params") or {})
         return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+    except HTTPException as exc:
+        raise exc
     except Exception as exc:
         return jsonrpc_error(request_id, -32000, str(exc))
 
@@ -202,26 +226,82 @@ def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     text = extract_text(message)
     metadata = merge_metadata(payload.get("metadata"), message.get("metadata"))
     skill_id = resolve_skill_id(text, metadata)
-    response_text = dispatch_skill(skill_id, text, metadata)
-    task = upsert_task(message, skill_id, response_text)
+
+    if not text:
+        text = "Ask the user for the missing input."
+
+    state = infer_task_state(text, metadata)
+    existing_task = TASKS.get(message.get("taskId") or message.get("task_id"))
+    if existing_task and existing_task.get("status", {}).get("state") == "TASK_STATE_CANCELED":
+        response_text = "This task was canceled. Start a new task to continue."
+        state = "TASK_STATE_CANCELED"
+    elif state == "TASK_STATE_WORKING":
+        response_text = "Task accepted and marked as working for lifecycle testing. Poll get_task with this task id."
+    else:
+        response_text = generate_llm_response(skill_id, text, existing_task)
+
+    task = upsert_task(message, skill_id, response_text, state)
     return {"task": task}
 
 
-def upsert_task(message: Dict[str, Any], skill_id: str, response_text: str) -> Dict[str, Any]:
+def generate_llm_response(skill_id: str, text: str, existing_task: Optional[Dict[str, Any]]) -> str:
+    api_key = configured_google_api_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Set GOOGLE_API_KEY or GEMINI_API_KEY before invoking the LLM agent.",
+        )
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=configured_model(),
+        contents=build_prompt(skill_id, text, existing_task),
+    )
+    result = getattr(response, "text", None)
+    if not result or not result.strip():
+        return "Gemini returned an empty response."
+    return result.strip()
+
+
+def build_prompt(skill_id: str, text: str, existing_task: Optional[Dict[str, Any]]) -> str:
+    history_text = ""
+    if existing_task:
+        recent_history = existing_task.get("history", [])[-3:]
+        history_text = "\nRecent task history:\n" + "\n".join(
+            "- User: %s\n  Agent: %s" % (item.get("text", ""), item.get("response", ""))
+            for item in recent_history
+        )
+
+    if skill_id == "llm_summarize":
+        instruction = "Summarize the user's text in 3 concise bullets. Do not invent facts."
+    elif skill_id == "llm_extract_actions":
+        instruction = "Extract action items from the user's text. Return concise bullets with owner, action, and due date when present."
+    else:
+        instruction = "Answer the user's request clearly and concisely."
+
+    return "%s\n%s\n\nUser request:\n%s" % (instruction, history_text, text)
+
+
+def upsert_task(message: Dict[str, Any], skill_id: str, response_text: str, state: str) -> Dict[str, Any]:
     task_id = message.get("taskId") or message.get("task_id") or str(uuid4())
-    context_id = message.get("contextId") or message.get("context_id") or str(uuid4())
-    state = infer_task_state(extract_text(message))
     existing = TASKS.get(task_id)
+    context_id = (
+        message.get("contextId")
+        or message.get("context_id")
+        or (existing or {}).get("contextId")
+        or str(uuid4())
+    )
     task = existing or {
         "id": task_id,
         "contextId": context_id,
         "kind": "task",
-        "metadata": {"skillId": skill_id},
+        "metadata": {"skillId": skill_id, "model": configured_model()},
         "history": [],
         "createdAt": utc_now(),
     }
     task["contextId"] = context_id
     task["metadata"]["skillId"] = skill_id
+    task["metadata"]["model"] = configured_model()
     task["status"] = {
         "state": state,
         "timestamp": utc_now(),
@@ -245,11 +325,21 @@ def upsert_task(message: Dict[str, Any], skill_id: str, response_text: str) -> D
                 "parts": [{"text": response_text, "mediaType": "text/plain"}],
             }
         ]
+    elif "artifacts" in task:
+        task.pop("artifacts")
     TASKS[task_id] = task
     return task
 
 
-def infer_task_state(text: str) -> str:
+def infer_task_state(text: str, metadata: Dict[str, Any]) -> str:
+    forced_state = str(metadata.get("forceState") or metadata.get("force_state") or "").strip().lower()
+    if forced_state in ("input_required", "input-required", "TASK_STATE_INPUT_REQUIRED".lower()):
+        return "TASK_STATE_INPUT_REQUIRED"
+    if forced_state in ("working", "TASK_STATE_WORKING".lower()):
+        return "TASK_STATE_WORKING"
+    if forced_state in ("completed", "complete", "TASK_STATE_COMPLETED".lower()):
+        return "TASK_STATE_COMPLETED"
+
     lowered = text.lower()
     if "need input" in lowered or "input required" in lowered:
         return "TASK_STATE_INPUT_REQUIRED"
@@ -258,8 +348,42 @@ def infer_task_state(text: str) -> str:
     return "TASK_STATE_COMPLETED"
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def resolve_skill_id(text: str, metadata: Dict[str, Any]) -> str:
+    requested = str(metadata.get("skillId") or metadata.get("skill_id") or "").strip().lower()
+    aliases = {
+        "chat": "llm_chat",
+        "llm_chat": "llm_chat",
+        "summarize": "llm_summarize",
+        "summary": "llm_summarize",
+        "llm_summarize": "llm_summarize",
+        "actions": "llm_extract_actions",
+        "extract_actions": "llm_extract_actions",
+        "llm_extract_actions": "llm_extract_actions",
+    }
+    if requested in aliases:
+        return aliases[requested]
+
+    lowered = text.lower()
+    if "summarize" in lowered or "summary" in lowered:
+        return "llm_summarize"
+    if "action item" in lowered or "extract actions" in lowered:
+        return "llm_extract_actions"
+    return "llm_chat"
+
+
+def response_message(text: str, request_message: Dict[str, Any]) -> Dict[str, Any]:
+    response: Dict[str, Any] = {
+        "messageId": str(uuid4()),
+        "role": "ROLE_AGENT",
+        "parts": [{"text": text, "mediaType": "text/plain"}],
+    }
+    context_id = request_message.get("contextId") or request_message.get("context_id")
+    task_id = request_message.get("taskId") or request_message.get("task_id")
+    if context_id:
+        response["contextId"] = context_id
+    if task_id:
+        response["taskId"] = task_id
+    return response
 
 
 def extract_text(message: Dict[str, Any]) -> str:
@@ -283,171 +407,5 @@ def merge_metadata(*items: Any) -> Dict[str, Any]:
     return merged
 
 
-def resolve_skill_id(text: str, metadata: Dict[str, Any]) -> str:
-    requested = str(metadata.get("skillId") or metadata.get("skill_id") or "").strip().lower()
-    aliases = {
-        "weather": "weather_lookup",
-        "weather_lookup": "weather_lookup",
-        "calculator": "calculator",
-        "calculate": "calculator",
-        "math": "calculator",
-        "text": "text_transform",
-        "text_transform": "text_transform",
-        "transform": "text_transform",
-    }
-    if requested in aliases:
-        return aliases[requested]
-
-    lowered = text.lower()
-    if any(word in lowered for word in ("weather", "forecast", "temperature")):
-        return "weather_lookup"
-    if any(word in lowered for word in ("uppercase", "lowercase", "title case", "reverse", "transform")):
-        return "text_transform"
-    if looks_like_calculation(lowered):
-        return "calculator"
-    return "help"
-
-
-def dispatch_skill(skill_id: str, text: str, metadata: Dict[str, Any]) -> str:
-    if skill_id == "weather_lookup":
-        return weather_lookup(text, metadata)
-    if skill_id == "calculator":
-        return calculator(text, metadata)
-    if skill_id == "text_transform":
-        return text_transform(text, metadata)
-    return (
-        "I can run weather_lookup, calculator, or text_transform. "
-        "Try 'weather in Bengaluru', 'calculate 12 * (4 + 2)', or 'uppercase hello agent'."
-    )
-
-
-def response_message(text: str, request_message: Dict[str, Any]) -> Dict[str, Any]:
-    response: Dict[str, Any] = {
-        "messageId": str(uuid4()),
-        "role": "ROLE_AGENT",
-        "parts": [{"text": text, "mediaType": "text/plain"}],
-    }
-    context_id = request_message.get("contextId") or request_message.get("context_id")
-    task_id = request_message.get("taskId") or request_message.get("task_id")
-    if context_id:
-        response["contextId"] = context_id
-    if task_id:
-        response["taskId"] = task_id
-    return response
-
-
-def weather_lookup(text: str, metadata: Dict[str, Any]) -> str:
-    requested_city = str(metadata.get("city") or "").strip()
-    lowered = (requested_city or text).lower()
-    forecasts = {
-        "bengaluru": "Bengaluru, India: now 24.0 C, partly cloudy, wind 11 km/h. Today: high 30 C, low 21 C, scattered showers.",
-        "bangalore": "Bengaluru, India: now 24.0 C, partly cloudy, wind 11 km/h. Today: high 30 C, low 21 C, scattered showers.",
-        "tokyo": "Tokyo, Japan: now 27.0 C, humid, wind 9 km/h. Today: high 31 C, low 24 C, light rain late evening.",
-        "chicago": "Chicago, USA: now 18.0 C, clear, wind 16 km/h. Today: high 23 C, low 14 C, dry and breezy.",
-    }
-    for city, forecast in forecasts.items():
-        if city in lowered:
-            return forecast
-    return "Tell me a supported city, for example: 'weather in Bengaluru', 'forecast for Tokyo', or 'weather in Chicago'."
-
-
-def looks_like_calculation(text: str) -> bool:
-    return bool(re.search(r"\d", text) and re.search(r"[+\-*/()]", text))
-
-
-def calculator(text: str, metadata: Dict[str, Any]) -> str:
-    expression = str(metadata.get("expression") or "").strip() or extract_expression(text)
-    if not expression:
-        return "Send a simple arithmetic expression, for example: 'calculate 12 * (4 + 2)'."
-    try:
-        result = evaluate_expression(expression)
-    except ZeroDivisionError:
-        return "Cannot divide by zero."
-    except Exception:
-        return "I can only evaluate numbers with +, -, *, /, and parentheses."
-    return "%s = %s" % (expression, format_number(result))
-
-
-def extract_expression(text: str) -> str:
-    candidate = re.sub(r"(?i)\b(calculate|compute|what is|what's|math|please)\b", " ", text)
-    candidate = candidate.strip(" ?:=\t\n")
-    allowed = "".join(ch for ch in candidate if ch.isdigit() or ch in " +-*/().")
-    return re.sub(r"\s+", " ", allowed).strip()
-
-
-ALLOWED_BINARY_OPERATORS: Dict[type, Callable[[float, float], float]] = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-}
-
-ALLOWED_UNARY_OPERATORS: Dict[type, Callable[[float], float]] = {
-    ast.UAdd: operator.pos,
-    ast.USub: operator.neg,
-}
-
-
-def evaluate_expression(expression: str) -> float:
-    parsed = ast.parse(expression, mode="eval")
-    return evaluate_node(parsed.body)
-
-
-def evaluate_node(node: ast.AST) -> float:
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return float(node.value)
-    if isinstance(node, ast.BinOp) and type(node.op) in ALLOWED_BINARY_OPERATORS:
-        return ALLOWED_BINARY_OPERATORS[type(node.op)](evaluate_node(node.left), evaluate_node(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in ALLOWED_UNARY_OPERATORS:
-        return ALLOWED_UNARY_OPERATORS[type(node.op)](evaluate_node(node.operand))
-    raise ValueError("unsupported expression")
-
-
-def format_number(value: float) -> str:
-    if value.is_integer():
-        return str(int(value))
-    return ("%.6f" % value).rstrip("0").rstrip(".")
-
-
-def text_transform(text: str, metadata: Dict[str, Any]) -> str:
-    operation = str(metadata.get("operation") or "").strip().lower()
-    content = str(metadata.get("text") or metadata.get("value") or "").strip()
-    if not operation:
-        operation = infer_text_operation(text)
-    if not content:
-        content = extract_transform_content(text, operation)
-    if not content:
-        return "Send text to transform, for example: 'uppercase hello agent' or 'reverse connector'."
-
-    if operation in ("uppercase", "upper"):
-        return content.upper()
-    if operation in ("lowercase", "lower"):
-        return content.lower()
-    if operation in ("title", "titlecase", "title case"):
-        return content.title()
-    if operation == "reverse":
-        return content[::-1]
-    return "Supported text operations are uppercase, lowercase, title case, and reverse."
-
-
-def infer_text_operation(text: str) -> str:
-    lowered = text.lower()
-    if "uppercase" in lowered or re.search(r"\bupper\b", lowered):
-        return "uppercase"
-    if "lowercase" in lowered or re.search(r"\blower\b", lowered):
-        return "lowercase"
-    if "title case" in lowered or re.search(r"\btitle\b", lowered):
-        return "title"
-    if "reverse" in lowered:
-        return "reverse"
-    return ""
-
-
-def extract_transform_content(text: str, operation: str) -> str:
-    if ":" in text:
-        return text.split(":", 1)[1].strip()
-    content = text
-    for phrase in ("uppercase", "lowercase", "title case", "titlecase", "reverse", "transform", operation):
-        if phrase:
-            content = re.sub(re.escape(phrase), " ", content, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", content).strip(" ?:=\t\n")
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()

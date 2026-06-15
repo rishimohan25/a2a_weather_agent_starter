@@ -1,14 +1,17 @@
 services:
   - type: web
-    name: a2a-basic-auth-agent
-    env: python
-    plan: free
+    name: a2a-llm-agent
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
       - key: PUBLIC_BASE_URL
+        value: https://a2a-llm-agent.onrender.com
+      - key: GOOGLE_API_KEY
         sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
       - key: A2A_BASIC_USERNAME
         value: a2a_user
       - key: A2A_BASIC_PASSWORD

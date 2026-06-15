@@ -1,6 +1,6 @@
-# A2A Basic Auth Interop Agent
+# A2A Gemini LLM Agent
 
-A small FastAPI A2A test agent with a public Agent Card, Basic-auth protected invocation, three deterministic skills, and in-memory task lifecycle endpoints.
+A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Card, Basic-auth protected invocation, and stateful task endpoints for gateway task lifecycle testing.
 
 ## Endpoints
 
@@ -16,9 +16,9 @@ The Agent Card and health endpoint are public. Invoke and task endpoints require
 
 ## Skills
 
-- `weather_lookup`: deterministic weather for Bengaluru, Tokyo, and Chicago.
-- `calculator`: evaluates simple arithmetic using `+`, `-`, `*`, `/`, and parentheses.
-- `text_transform`: uppercase, lowercase, title case, or reverse.
+- `llm_chat`: general Gemini-backed response.
+- `llm_summarize`: concise summary bullets.
+- `llm_extract_actions`: action item extraction.
 
 ## Local Run
 
@@ -26,15 +26,17 @@ The Agent Card and health endpoint are public. Invoke and task endpoints require
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export A2A_BASIC_USERNAME=a2a_user
-export A2A_BASIC_PASSWORD=Welcome1
-export PUBLIC_BASE_URL=http://localhost:8080
+export GOOGLE_API_KEY='<your-google-api-key>'
+export GEMINI_MODEL='gemini-3.5-flash'
+export A2A_BASIC_USERNAME='rismohan'
+export A2A_BASIC_PASSWORD='Welcome@123'
+export PUBLIC_BASE_URL='http://localhost:8080'
 uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
 ## Render Deployment
 
-Create a Render Web Service from the repository containing these files.
+Create a Render Web Service from a repository containing this folder.
 
 - Runtime: Python 3
 - Build command: `pip install -r requirements.txt`
@@ -45,11 +47,15 @@ Set environment variables:
 
 ```text
 PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
-A2A_BASIC_USERNAME=<your-user>
-A2A_BASIC_PASSWORD=<your-password>
+GOOGLE_API_KEY=<your-google-api-key>
+GEMINI_MODEL=gemini-3.5-flash
+A2A_BASIC_USERNAME=rismohan
+A2A_BASIC_PASSWORD=Welcome@123
 ```
 
-## Curl Tests
+Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
+
+## Direct Curl Tests
 
 Fetch the public Agent Card:
 
@@ -57,100 +63,78 @@ Fetch the public Agent Card:
 curl 'https://<your-render-service>.onrender.com/.well-known/agent-card.json'
 ```
 
-Verify invoke requires auth:
+Check health:
 
 ```bash
-curl -i -X POST 'https://<your-render-service>.onrender.com/' \
-  --header 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}}'
+curl 'https://<your-render-service>.onrender.com/health'
 ```
 
-Call the weather skill:
-
-```bash
-curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user '<your-user>:<your-password>' \
-  --header 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"metadata":{"skillId":"weather_lookup"},"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}}'
-```
-
-Call the HTTP+JSON send endpoint and create a task:
+Create a Gemini-backed task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user '<your-user>:<your-password>' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/a2a+json' \
-  --data '{"metadata":{"skillId":"weather_lookup"},"message":{"messageId":"m-http-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}'
+  --data '{
+    "metadata": {"skillId": "llm_chat"},
+    "message": {
+      "messageId": "msg-llm-1",
+      "role": "ROLE_USER",
+      "parts": [
+        {"text": "Explain A2A task state in two short sentences."}
+      ]
+    }
+  }'
 ```
 
-Continue an existing task by sending `taskId` and `contextId` from a previous response:
-
-```bash
-curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user '<your-user>:<your-password>' \
-  --header 'Content-Type: application/a2a+json' \
-  --data '{"message":{"messageId":"m-http-2","role":"ROLE_USER","taskId":"<task-id>","contextId":"<context-id>","parts":[{"text":"forecast for Tokyo"}]}}'
-```
-
-Get a task:
+Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
-  --user '<your-user>:<your-password>'
+  --user 'rismohan:Welcome@123'
 ```
-
-List tasks for a context:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
-  --user '<your-user>:<your-password>'
+  --user 'rismohan:Welcome@123'
 ```
 
-Cancel a task:
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
+  --user 'rismohan:Welcome@123' \
+  --header 'Content-Type: application/a2a+json' \
+  --data '{
+    "metadata": {"skillId": "llm_chat"},
+    "message": {
+      "messageId": "msg-llm-2",
+      "role": "ROLE_USER",
+      "taskId": "<task-id>",
+      "contextId": "<context-id>",
+      "parts": [
+        {"text": "Continue the same answer with one practical example."}
+      ]
+    }
+  }'
+```
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
-  --user '<your-user>:<your-password>'
+  --user 'rismohan:Welcome@123'
 ```
 
-Call the calculator skill:
+## Gateway Test Flow
 
-```bash
-curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user '<your-user>:<your-password>' \
-  --header 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":"2","method":"message/send","params":{"metadata":{"skillId":"calculator"},"message":{"messageId":"m-2","role":"ROLE_USER","parts":[{"text":"calculate 12 * (4 + 2)"}]}}}'
-```
+Generate connector runtime metadata from the Agent Card and make sure it includes:
 
-Call the text transform skill:
+- connector protocol: `A2A`
+- `connector.a2a.statefulTasks=true`
+- `a2a.skill.message.send`: `POST /message:send`
+- `a2a.task.get`: `GET /tasks/{taskId}`
+- `a2a.task.list`: `GET /tasks`
+- `a2a.task.cancel`: `POST /tasks/{taskId}:cancel`
+- `a2a.task.continue`: `POST /message:send`
 
-```bash
-curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user '<your-user>:<your-password>' \
-  --header 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":"3","method":"message/send","params":{"metadata":{"skillId":"text_transform"},"message":{"messageId":"m-3","role":"ROLE_USER","parts":[{"text":"uppercase hello agent"}]}}}'
-```
-
-## Connector Gateway Notes
-
-The Agent Card advertises Basic auth through `securitySchemes` and `securityRequirements`.
-
-Runtime metadata should map this to an auth profile similar to:
-
-```json
-{
-  "id": "basic_profile",
-  "displayName": "Basic Authentication",
-  "authType": "basic",
-  "tokenSource": "stored",
-  "inputBindings": {
-    "username": "${authentication.username}",
-    "password": "${authentication.password}"
-  }
-}
-```
-
-Store the actual values in connector config or vault:
+Store auth in connector config or vault:
 
 ```json
 {
@@ -159,20 +143,20 @@ Store the actual values in connector config or vault:
   },
   "authentication": {
     "selectedAuthProfile": "basic_profile",
-    "username": "<your-user>",
-    "password": "<your-password>"
+    "username": "rismohan",
+    "password": "Welcome@123"
   }
 }
 ```
 
-Do not store the username/password in the Agent Card or connector runtime metadata.
+Then test through the gateway MCP endpoint:
 
-For stateful gateway testing, generate metadata with `connector.a2a.statefulTasks=true` and lifecycle operations for:
+1. `initialize`
+2. `tools/list`
+3. call the LLM skill tool
+4. call the generated get task tool with `{}` to verify active task state
+5. call the generated list task tool with `{}`
+6. call the generated continue task tool with only `text`
+7. call the generated cancel task tool with `{}`
 
-- `a2a.skill.message.send`: `POST /message:send`
-- `a2a.task.get`: `GET /tasks/{taskId}`
-- `a2a.task.list`: `GET /tasks`
-- `a2a.task.cancel`: `POST /tasks/{taskId}:cancel`
-- `a2a.task.continue`: `POST /message:send`
-
-The gateway should store only task identifiers and status by MCP session. It should not persist the full message history returned by this test agent.
+The important distributed-cache check is step 4: after a skill call creates a task, the gateway should be able to call get/list/continue/cancel without the caller passing `taskId`, because the active task is stored by MCP session.
