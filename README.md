@@ -28,8 +28,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export GOOGLE_API_KEY='<your-google-api-key>'
 export GEMINI_MODEL='gemini-3.5-flash'
-export A2A_BASIC_USERNAME='rismohan'
-export A2A_BASIC_PASSWORD='Welcome@123'
+export A2A_BASIC_USERNAME='test'
+export A2A_BASIC_PASSWORD='password'
 export PUBLIC_BASE_URL='http://localhost:8080'
 uvicorn main:app --host 0.0.0.0 --port 8080
 ```
