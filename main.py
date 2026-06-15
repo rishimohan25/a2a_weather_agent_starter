@@ -5,7 +5,8 @@ import operator
 import os
 import re
 import secrets
-from typing import Any, Callable, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -20,6 +21,7 @@ DEFAULT_PASSWORD = "Welcome1"
 
 security = HTTPBasic(auto_error=False)
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
+TASKS: Dict[str, Dict[str, Any]] = {}
 
 
 def configured_username() -> str:
@@ -71,6 +73,7 @@ def agent_card() -> Dict[str, Any]:
             "streaming": False,
             "pushNotifications": False,
             "extendedAgentCard": False,
+            "statefulTasks": True,
         },
         "defaultInputModes": ["text/plain", "application/json"],
         "defaultOutputModes": ["text/plain", "application/json"],
@@ -151,6 +154,36 @@ async def http_json_send_message(request: Request, _: str = Depends(require_basi
     return handle_send_message(payload)
 
 
+@app.get("/tasks/{task_id}")
+def get_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+    task = TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task
+
+
+@app.get("/tasks")
+def list_tasks(contextId: Optional[str] = None, _: str = Depends(require_basic_auth)) -> List[Dict[str, Any]]:
+    tasks = list(TASKS.values())
+    if contextId:
+        tasks = [task for task in tasks if task.get("contextId") == contextId]
+    return tasks
+
+
+@app.post("/tasks/{task_id}:cancel")
+def cancel_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+    task = TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    task["status"] = {
+        "state": "TASK_STATE_CANCELED",
+        "timestamp": utc_now(),
+        "message": response_message("Task canceled.", {"contextId": task.get("contextId"), "taskId": task_id}),
+    }
+    task["updatedAt"] = utc_now()
+    return task
+
+
 def jsonrpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {
@@ -170,7 +203,63 @@ def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
     metadata = merge_metadata(payload.get("metadata"), message.get("metadata"))
     skill_id = resolve_skill_id(text, metadata)
     response_text = dispatch_skill(skill_id, text, metadata)
-    return {"message": response_message(response_text, message)}
+    task = upsert_task(message, skill_id, response_text)
+    return {"task": task}
+
+
+def upsert_task(message: Dict[str, Any], skill_id: str, response_text: str) -> Dict[str, Any]:
+    task_id = message.get("taskId") or message.get("task_id") or str(uuid4())
+    context_id = message.get("contextId") or message.get("context_id") or str(uuid4())
+    state = infer_task_state(extract_text(message))
+    existing = TASKS.get(task_id)
+    task = existing or {
+        "id": task_id,
+        "contextId": context_id,
+        "kind": "task",
+        "metadata": {"skillId": skill_id},
+        "history": [],
+        "createdAt": utc_now(),
+    }
+    task["contextId"] = context_id
+    task["metadata"]["skillId"] = skill_id
+    task["status"] = {
+        "state": state,
+        "timestamp": utc_now(),
+        "message": response_message(response_text, {"contextId": context_id, "taskId": task_id}),
+    }
+    task["updatedAt"] = utc_now()
+    task["history"].append(
+        {
+            "messageId": message.get("messageId") or message.get("message_id"),
+            "text": extract_text(message),
+            "response": response_text,
+            "state": state,
+            "timestamp": utc_now(),
+        }
+    )
+    if state == "TASK_STATE_COMPLETED":
+        task["artifacts"] = [
+            {
+                "artifactId": "artifact-" + task_id,
+                "name": skill_id + "-result",
+                "parts": [{"text": response_text, "mediaType": "text/plain"}],
+            }
+        ]
+    TASKS[task_id] = task
+    return task
+
+
+def infer_task_state(text: str) -> str:
+    lowered = text.lower()
+    if "need input" in lowered or "input required" in lowered:
+        return "TASK_STATE_INPUT_REQUIRED"
+    if "working" in lowered or "long running" in lowered:
+        return "TASK_STATE_WORKING"
+    return "TASK_STATE_COMPLETED"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def extract_text(message: Dict[str, Any]) -> str:

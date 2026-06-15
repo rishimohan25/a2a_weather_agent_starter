@@ -1,6 +1,6 @@
 # A2A Basic Auth Interop Agent
 
-A small FastAPI A2A test agent with a public Agent Card, Basic-auth protected invocation, and three deterministic skills.
+A small FastAPI A2A test agent with a public Agent Card, Basic-auth protected invocation, three deterministic skills, and in-memory task lifecycle endpoints.
 
 ## Endpoints
 
@@ -8,8 +8,11 @@ A small FastAPI A2A test agent with a public Agent Card, Basic-auth protected in
 - `GET /.well-known/agent-card.json`
 - `POST /` for JSON-RPC `message/send`
 - `POST /message:send` for HTTP+JSON style `SendMessageRequest`
+- `GET /tasks/{taskId}` for task polling
+- `GET /tasks?contextId=<contextId>` for task listing
+- `POST /tasks/{taskId}:cancel` for task cancel
 
-The Agent Card and health endpoint are public. Invoke endpoints require HTTP Basic auth.
+The Agent Card and health endpoint are public. Invoke and task endpoints require HTTP Basic auth.
 
 ## Skills
 
@@ -71,6 +74,45 @@ curl -X POST 'https://<your-render-service>.onrender.com/' \
   --data '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"metadata":{"skillId":"weather_lookup"},"message":{"messageId":"m-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}}'
 ```
 
+Call the HTTP+JSON send endpoint and create a task:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
+  --user '<your-user>:<your-password>' \
+  --header 'Content-Type: application/a2a+json' \
+  --data '{"metadata":{"skillId":"weather_lookup"},"message":{"messageId":"m-http-1","role":"ROLE_USER","parts":[{"text":"weather in Bengaluru"}]}}'
+```
+
+Continue an existing task by sending `taskId` and `contextId` from a previous response:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
+  --user '<your-user>:<your-password>' \
+  --header 'Content-Type: application/a2a+json' \
+  --data '{"message":{"messageId":"m-http-2","role":"ROLE_USER","taskId":"<task-id>","contextId":"<context-id>","parts":[{"text":"forecast for Tokyo"}]}}'
+```
+
+Get a task:
+
+```bash
+curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
+  --user '<your-user>:<your-password>'
+```
+
+List tasks for a context:
+
+```bash
+curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
+  --user '<your-user>:<your-password>'
+```
+
+Cancel a task:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
+  --user '<your-user>:<your-password>'
+```
+
 Call the calculator skill:
 
 ```bash
@@ -124,3 +166,13 @@ Store the actual values in connector config or vault:
 ```
 
 Do not store the username/password in the Agent Card or connector runtime metadata.
+
+For stateful gateway testing, generate metadata with `connector.a2a.statefulTasks=true` and lifecycle operations for:
+
+- `a2a.skill.message.send`: `POST /message:send`
+- `a2a.task.get`: `GET /tasks/{taskId}`
+- `a2a.task.list`: `GET /tasks`
+- `a2a.task.cancel`: `POST /tasks/{taskId}:cancel`
+- `a2a.task.continue`: `POST /message:send`
+
+The gateway should store only task identifiers and status by MCP session. It should not persist the full message history returned by this test agent.
