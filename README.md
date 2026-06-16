@@ -8,6 +8,7 @@ A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Ca
 - `GET /.well-known/agent-card.json`
 - `POST /` for JSON-RPC `message/send`
 - `POST /message:send` for HTTP+JSON style `SendMessageRequest`
+- `POST /message:stream` for HTTP+JSON SSE streaming
 - `GET /tasks/{taskId}` for task polling
 - `GET /tasks?contextId=<contextId>` for task listing
 - `POST /tasks/{taskId}:cancel` for task cancel
@@ -28,8 +29,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export GOOGLE_API_KEY='<your-google-api-key>'
 export GEMINI_MODEL='gemini-3.5-flash'
-export A2A_BASIC_USERNAME='rismohan'
-export A2A_BASIC_PASSWORD='Welcome@123'
+export A2A_BASIC_USERNAME='username'
+export A2A_BASIC_PASSWORD='password'
 export PUBLIC_BASE_URL='http://localhost:8080'
 uvicorn main:app --host 0.0.0.0 --port 8080
 ```
@@ -49,8 +50,8 @@ Set environment variables:
 PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
 GOOGLE_API_KEY=<your-google-api-key>
 GEMINI_MODEL=gemini-3.5-flash
-A2A_BASIC_USERNAME=rismohan
-A2A_BASIC_PASSWORD=Welcome@123
+A2A_BASIC_USERNAME=username
+A2A_BASIC_PASSWORD=password
 ```
 
 Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
@@ -73,7 +74,7 @@ Create a Gemini-backed task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user 'username:password' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -87,21 +88,40 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
   }'
 ```
 
+Create a streamed Gemini-backed task:
+
+```bash
+curl -N -X POST 'https://<your-render-service>.onrender.com/message:stream' \
+  --user 'username:password' \
+  --header 'Content-Type: application/a2a+json' \
+  --header 'Accept: text/event-stream' \
+  --data '{
+    "metadata": {"skillId": "llm_chat"},
+    "message": {
+      "messageId": "msg-llm-stream-1",
+      "role": "ROLE_USER",
+      "parts": [
+        {"text": "Explain A2A streaming in two short sentences."}
+      ]
+    }
+  }'
+```
+
 Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
-  --user 'rismohan:Welcome@123'
+  --user 'username:password'
 ```
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
-  --user 'rismohan:Welcome@123'
+  --user 'username:password'
 ```
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user 'username:password' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -119,7 +139,7 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
-  --user 'rismohan:Welcome@123'
+  --user 'username:password'
 ```
 
 ## Gateway Test Flow
@@ -128,7 +148,7 @@ Generate connector runtime metadata from the Agent Card and make sure it include
 
 - connector protocol: `A2A`
 - `connector.a2a.statefulTasks=true`
-- `a2a.skill.message.send`: `POST /message:send`
+- `a2a.skill.message.send`: `POST /message:send`, or `a2a.skill.message.stream`: `POST /message:stream` for streamed skills
 - `a2a.task.get`: `GET /tasks/{taskId}`
 - `a2a.task.list`: `GET /tasks`
 - `a2a.task.cancel`: `POST /tasks/{taskId}:cancel`
@@ -143,8 +163,8 @@ Store auth in connector config or vault:
   },
   "authentication": {
     "selectedAuthProfile": "basic_profile",
-    "username": "rismohan",
-    "password": "Welcome@123"
+    "username": "username",
+    "password": "password"
   }
 }
 ```

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import json
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from google import genai
 
@@ -83,7 +85,7 @@ def agent_card() -> Dict[str, Any]:
             "url": base_url,
         },
         "capabilities": {
-            "streaming": False,
+            "streaming": True,
             "pushNotifications": False,
             "extendedAgentCard": False,
             "statefulTasks": True,
@@ -93,12 +95,12 @@ def agent_card() -> Dict[str, Any]:
         "supportedInterfaces": [
             {
                 "url": base_url,
-                "protocolBinding": "JSONRPC",
+                "protocolBinding": "HTTP+JSON",
                 "protocolVersion": "1.0",
             },
             {
-                "url": base_url + "/message:send",
-                "protocolBinding": "HTTP+JSON",
+                "url": base_url,
+                "protocolBinding": "JSONRPC",
                 "protocolVersion": "1.0",
             },
         ],
@@ -178,6 +180,16 @@ async def http_json_send_message(request: Request, _: str = Depends(require_basi
     return handle_send_message(payload)
 
 
+@app.post("/message:stream")
+async def http_json_stream_message(request: Request, _: str = Depends(require_basic_auth)) -> StreamingResponse:
+    payload = await request.json()
+    return StreamingResponse(
+        stream_send_message(payload),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
     task = TASKS.get(task_id)
@@ -242,6 +254,82 @@ def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     task = upsert_task(message, skill_id, response_text, state)
     return {"task": task}
+
+
+async def stream_send_message(payload: Dict[str, Any]):
+    message = payload.get("message") or {}
+    text = extract_text(message) or "Ask the user for the missing input."
+    metadata = merge_metadata(payload.get("metadata"), message.get("metadata"))
+    skill_id = resolve_skill_id(text, metadata)
+    existing_task = TASKS.get(message.get("taskId") or message.get("task_id"))
+
+    working_task = upsert_task(
+        message,
+        skill_id,
+        "Gemini request accepted.",
+        "TASK_STATE_WORKING",
+    )
+    task_id = working_task["id"]
+    context_id = working_task["contextId"]
+    yield sse_data({"task": working_task})
+    await asyncio.sleep(0.1)
+
+    yield sse_data(
+        {
+            "statusUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {
+                    "state": "TASK_STATE_WORKING",
+                    "timestamp": utc_now(),
+                    "message": response_message("Generating response with Gemini.", {"contextId": context_id, "taskId": task_id}),
+                },
+            }
+        }
+    )
+    await asyncio.sleep(0.1)
+
+    try:
+        response_text = generate_llm_response(skill_id, text, existing_task)
+        final_state = "TASK_STATE_COMPLETED"
+    except HTTPException as exc:
+        response_text = str(exc.detail)
+        final_state = "TASK_STATE_FAILED"
+
+    final_task = upsert_task(
+        {**message, "taskId": task_id, "contextId": context_id},
+        skill_id,
+        response_text,
+        final_state,
+    )
+    yield sse_data(
+        {
+            "artifactUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "artifact": {
+                    "artifactId": "artifact-" + task_id,
+                    "name": skill_id + "-stream-result",
+                    "parts": [{"text": response_text, "mediaType": "text/plain"}],
+                },
+            }
+        }
+    )
+    await asyncio.sleep(0.1)
+    yield sse_data(
+        {
+            "statusUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": final_task["status"],
+                "final": True,
+            }
+        }
+    )
+
+
+def sse_data(payload: Dict[str, Any]) -> str:
+    return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
 
 
 def generate_llm_response(skill_id: str, text: str, existing_task: Optional[Dict[str, Any]]) -> str:
