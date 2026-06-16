@@ -19,6 +19,13 @@ APP_VERSION = "1.0.0"
 DEFAULT_USERNAME = "a2a_user"
 DEFAULT_PASSWORD = "Welcome1"
 DEFAULT_MODEL = "gemini-3.5-flash"
+TERMINAL_TASK_STATES = {
+    "TASK_STATE_COMPLETED",
+    "TASK_STATE_FAILED",
+    "TASK_STATE_CANCELED",
+    "TASK_STATE_CANCELLED",
+    "TASK_STATE_REJECTED",
+}
 
 security = HTTPBasic(auto_error=False)
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
@@ -220,6 +227,20 @@ def cancel_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str,
     return task
 
 
+@app.post("/tasks/{task_id}:subscribe")
+async def subscribe_task(task_id: str, _: str = Depends(require_basic_auth)) -> StreamingResponse:
+    task = TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    if is_terminal_task(task):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task is already terminal")
+    return StreamingResponse(
+        stream_task_subscription(task_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def jsonrpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {
@@ -254,6 +275,67 @@ def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     task = upsert_task(message, skill_id, response_text, state)
     return {"task": task}
+
+
+async def stream_task_subscription(task_id: str):
+    task = TASKS[task_id]
+    context_id = task["contextId"]
+    skill_id = task.get("metadata", {}).get("skillId") or "llm_chat"
+    text = latest_user_text(task) or "Continue this task."
+
+    yield sse_data({"task": task})
+    await asyncio.sleep(0.1)
+
+    working_task = update_task_status(
+        task,
+        "Generating response with Gemini.",
+        "TASK_STATE_WORKING",
+    )
+    yield sse_data(
+        {
+            "statusUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": working_task["status"],
+            }
+        }
+    )
+    await asyncio.sleep(0.1)
+
+    try:
+        response_text = generate_llm_response(skill_id, text, task)
+        final_state = "TASK_STATE_COMPLETED"
+    except HTTPException as exc:
+        response_text = str(exc.detail)
+        final_state = "TASK_STATE_FAILED"
+
+    final_task = upsert_task(
+        {"taskId": task_id, "contextId": context_id, "parts": [{"text": text}]},
+        skill_id,
+        response_text,
+        final_state,
+    )
+    if final_state == "TASK_STATE_COMPLETED":
+        yield sse_data(
+            {
+                "artifactUpdate": {
+                    "taskId": task_id,
+                    "contextId": context_id,
+                    "artifact": final_task["artifacts"][0],
+                }
+            }
+        )
+        await asyncio.sleep(0.1)
+    yield sse_data(
+        {
+            "statusUpdate": {
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": final_task["status"],
+                "final": True,
+            }
+        }
+    )
 
 
 async def stream_send_message(payload: Dict[str, Any]):
@@ -431,7 +513,14 @@ def infer_task_state(text: str, metadata: Dict[str, Any]) -> str:
     lowered = text.lower()
     if "need input" in lowered or "input required" in lowered:
         return "TASK_STATE_INPUT_REQUIRED"
-    if "working" in lowered or "long running" in lowered:
+    if (
+        "working" in lowered
+        or "long running" in lowered
+        or "latest info" in lowered
+        or "latest information" in lowered
+        or "research" in lowered
+        or "async" in lowered
+    ):
         return "TASK_STATE_WORKING"
     return "TASK_STATE_COMPLETED"
 
@@ -497,3 +586,28 @@ def merge_metadata(*items: Any) -> Dict[str, Any]:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_terminal_task(task: Dict[str, Any]) -> bool:
+    return str(task.get("status", {}).get("state") or "").upper() in TERMINAL_TASK_STATES
+
+
+def latest_user_text(task: Dict[str, Any]) -> str:
+    for item in reversed(task.get("history", [])):
+        text = str(item.get("text") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def update_task_status(task: Dict[str, Any], response_text: str, state: str) -> Dict[str, Any]:
+    task_id = task["id"]
+    context_id = task["contextId"]
+    task["status"] = {
+        "state": state,
+        "timestamp": utc_now(),
+        "message": response_message(response_text, {"contextId": context_id, "taskId": task_id}),
+    }
+    task["updatedAt"] = utc_now()
+    TASKS[task_id] = task
+    return task

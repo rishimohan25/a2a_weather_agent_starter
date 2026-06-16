@@ -12,6 +12,7 @@ A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Ca
 - `GET /tasks/{taskId}` for task polling
 - `GET /tasks?contextId=<contextId>` for task listing
 - `POST /tasks/{taskId}:cancel` for task cancel
+- `POST /tasks/{taskId}:subscribe` for SSE subscription to a non-terminal task
 
 The Agent Card and health endpoint are public. Invoke and task endpoints require HTTP Basic auth.
 
@@ -88,6 +89,24 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
   }'
 ```
 
+Create a non-terminal async task:
+
+```bash
+curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
+  --user 'username:password' \
+  --header 'Content-Type: application/a2a+json' \
+  --data '{
+    "metadata": {"skillId": "llm_chat"},
+    "message": {
+      "messageId": "msg-llm-async-1",
+      "role": "ROLE_USER",
+      "parts": [
+        {"text": "Get the latest info about Nvidia"}
+      ]
+    }
+  }'
+```
+
 Create a streamed Gemini-backed task:
 
 ```bash
@@ -112,6 +131,14 @@ Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
   --user 'username:password'
+```
+
+Subscribe to a non-terminal task and complete it:
+
+```bash
+curl -N -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:subscribe' \
+  --user 'username:password' \
+  --header 'Accept: text/event-stream'
 ```
 
 ```bash
@@ -150,6 +177,7 @@ Generate connector runtime metadata from the Agent Card and make sure it include
 - `connector.a2a.statefulTasks=true`
 - `a2a.skill.message.send`: `POST /message:send`, or `a2a.skill.message.stream`: `POST /message:stream` for streamed skills
 - `a2a.task.get`: `GET /tasks/{taskId}`
+- `a2a.task.subscribe`: `POST /tasks/{taskId}:subscribe` as a hidden operation routed from get-task when `subscribe=true`
 - `a2a.task.list`: `GET /tasks`
 - `a2a.task.cancel`: `POST /tasks/{taskId}:cancel`
 - `a2a.task.continue`: `POST /message:send`
@@ -175,8 +203,9 @@ Then test through the gateway MCP endpoint:
 2. `tools/list`
 3. call the LLM skill tool
 4. call the generated get task tool with `{}` to verify active task state
-5. call the generated list task tool with `{}`
-6. call the generated continue task tool with only `text`
-7. call the generated cancel task tool with `{}`
+5. call the generated get task tool with `{"subscribe": true}` to subscribe until completion
+6. call the generated list task tool with `{}`
+7. call the generated continue task tool with only `text`
+8. call the generated cancel task tool with `{}`
 
 The important distributed-cache check is step 4: after a skill call creates a task, the gateway should be able to call get/list/continue/cancel without the caller passing `taskId`, because the active task is stored by MCP session.
