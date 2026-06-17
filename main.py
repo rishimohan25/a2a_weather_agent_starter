@@ -165,18 +165,45 @@ def agent_card() -> Dict[str, Any]:
 
 
 @app.post("/")
-async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth)) -> JSONResponse:
+async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth)):
     payload = await request.json()
     request_id = payload.get("id")
     if payload.get("jsonrpc") != "2.0":
         return jsonrpc_error(request_id, -32600, "Invalid JSON-RPC request")
-    if payload.get("method") != "message/send":
-        return jsonrpc_error(request_id, -32601, "Method not found")
+    method = normalize_jsonrpc_method(payload.get("method"))
+    params = payload.get("params") or {}
+    if not isinstance(params, dict):
+        return jsonrpc_error(request_id, -32602, "JSON-RPC params must be an object")
     try:
-        result = handle_send_message(payload.get("params") or {})
-        return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+        if method == "SendMessage":
+            return jsonrpc_result(request_id, handle_send_message(params))
+        if method == "SendStreamingMessage":
+            return StreamingResponse(
+                jsonrpc_wrap_sse_stream(request_id, stream_send_message(params)),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        if method == "GetTask":
+            return jsonrpc_result(request_id, get_task_payload(required_task_id(params)))
+        if method == "ListTasks":
+            return jsonrpc_result(request_id, {"tasks": list_tasks_payload(optional_context_id(params))})
+        if method == "CancelTask":
+            return jsonrpc_result(request_id, cancel_task_payload(required_task_id(params)))
+        if method == "SubscribeToTask":
+            task_id = required_task_id(params)
+            task = TASKS.get(task_id)
+            if task is None:
+                return jsonrpc_sse_error(request_id, -32004, "Task not found")
+            if is_terminal_task(task):
+                return jsonrpc_sse_error(request_id, -32005, "Task is already terminal")
+            return StreamingResponse(
+                jsonrpc_wrap_sse_stream(request_id, stream_task_subscription(task_id)),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        return jsonrpc_error(request_id, -32601, "Method not found")
     except HTTPException as exc:
-        raise exc
+        return jsonrpc_error(request_id, -32000, str(exc.detail))
     except Exception as exc:
         return jsonrpc_error(request_id, -32000, str(exc))
 
@@ -199,32 +226,17 @@ async def http_json_stream_message(request: Request, _: str = Depends(require_ba
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
-    task = TASKS.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-    return task
+    return get_task_payload(task_id)
 
 
 @app.get("/tasks")
 def list_tasks(contextId: Optional[str] = None, _: str = Depends(require_basic_auth)) -> List[Dict[str, Any]]:
-    tasks = list(TASKS.values())
-    if contextId:
-        tasks = [task for task in tasks if task.get("contextId") == contextId]
-    return tasks
+    return list_tasks_payload(contextId)
 
 
 @app.post("/tasks/{task_id}:cancel")
 def cancel_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
-    task = TASKS.get(task_id)
-    if task is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-    task["status"] = {
-        "state": "TASK_STATE_CANCELED",
-        "timestamp": utc_now(),
-        "message": response_message("Task canceled.", {"contextId": task.get("contextId"), "taskId": task_id}),
-    }
-    task["updatedAt"] = utc_now()
-    return task
+    return cancel_task_payload(task_id)
 
 
 @app.post("/tasks/{task_id}:subscribe")
@@ -241,6 +253,10 @@ async def subscribe_task(task_id: str, _: str = Depends(require_basic_auth)) -> 
     )
 
 
+def jsonrpc_result(request_id: Any, result: Any) -> JSONResponse:
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
 def jsonrpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
     return JSONResponse(
         {
@@ -252,6 +268,96 @@ def jsonrpc_error(request_id: Any, code: int, message: str) -> JSONResponse:
             },
         }
     )
+
+
+def jsonrpc_sse_error(request_id: Any, code: int, message: str) -> StreamingResponse:
+    async def error_stream():
+        yield sse_data(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": code,
+                    "message": message,
+                },
+            }
+        )
+
+    return StreamingResponse(
+        error_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def normalize_jsonrpc_method(method: Any) -> str:
+    aliases = {
+        "message/send": "SendMessage",
+        "message:send": "SendMessage",
+        "SendMessage": "SendMessage",
+        "sendMessage": "SendMessage",
+        "message/stream": "SendStreamingMessage",
+        "message:stream": "SendStreamingMessage",
+        "SendStreamingMessage": "SendStreamingMessage",
+        "sendStreamingMessage": "SendStreamingMessage",
+        "tasks/get": "GetTask",
+        "GetTask": "GetTask",
+        "getTask": "GetTask",
+        "tasks/list": "ListTasks",
+        "ListTasks": "ListTasks",
+        "listTasks": "ListTasks",
+        "tasks/cancel": "CancelTask",
+        "CancelTask": "CancelTask",
+        "cancelTask": "CancelTask",
+        "tasks/subscribe": "SubscribeToTask",
+        "SubscribeToTask": "SubscribeToTask",
+        "subscribeToTask": "SubscribeToTask",
+    }
+    return aliases.get(str(method), "")
+
+
+def required_task_id(params: Dict[str, Any]) -> str:
+    task_id = (
+        params.get("id")
+        or params.get("taskId")
+        or params.get("task_id")
+        or (params.get("task") or {}).get("id")
+    )
+    if not task_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Task id is required")
+    return str(task_id)
+
+
+def optional_context_id(params: Dict[str, Any]) -> Optional[str]:
+    context_id = params.get("contextId") or params.get("context_id")
+    if not context_id and isinstance(params.get("filter"), dict):
+        context_id = params["filter"].get("contextId") or params["filter"].get("context_id")
+    return str(context_id) if context_id else None
+
+
+def get_task_payload(task_id: str) -> Dict[str, Any]:
+    task = TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    return task
+
+
+def list_tasks_payload(context_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    tasks = list(TASKS.values())
+    if context_id:
+        tasks = [task for task in tasks if task.get("contextId") == context_id]
+    return tasks
+
+
+def cancel_task_payload(task_id: str) -> Dict[str, Any]:
+    task = get_task_payload(task_id)
+    task["status"] = {
+        "state": "TASK_STATE_CANCELED",
+        "timestamp": utc_now(),
+        "message": response_message("Task canceled.", {"contextId": task.get("contextId"), "taskId": task_id}),
+    }
+    task["updatedAt"] = utc_now()
+    return task
 
 
 def handle_send_message(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -412,6 +518,27 @@ async def stream_send_message(payload: Dict[str, Any]):
 
 def sse_data(payload: Dict[str, Any]) -> str:
     return "data: " + json.dumps(payload, separators=(",", ":")) + "\n\n"
+
+
+async def jsonrpc_wrap_sse_stream(request_id: Any, a2a_stream):
+    async for chunk in a2a_stream:
+        for line in str(chunk).splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                result = json.loads(data)
+            except json.JSONDecodeError:
+                result = {"message": {"parts": [{"text": data}]}}
+            yield sse_data(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": result,
+                }
+            )
 
 
 def generate_llm_response(skill_id: str, text: str, existing_task: Optional[Dict[str, Any]]) -> str:
