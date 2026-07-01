@@ -1,11 +1,12 @@
 # A2A Gemini LLM Agent
 
-A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Card, Basic-auth protected invocation, and stateful task endpoints for gateway task lifecycle testing.
+A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Card, selectable Basic or OAuth 2.0 protected invocation, and stateful task endpoints for gateway task lifecycle testing.
 
 ## Endpoints
 
 - `GET /health`
 - `GET /.well-known/agent-card.json`
+- `POST /oauth/token` for OAuth 2.0 client credentials token issuance
 - `POST /` for JSON-RPC methods
 - `POST /message:send` for HTTP+JSON style `SendMessageRequest`
 - `POST /message:stream` for HTTP+JSON SSE streaming
@@ -14,7 +15,7 @@ A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Ca
 - `POST /tasks/{taskId}:cancel` for task cancel
 - `POST /tasks/{taskId}:subscribe` for SSE subscription to a non-terminal task
 
-The Agent Card and health endpoint are public. Invoke and task endpoints require HTTP Basic auth.
+The Agent Card and health endpoint are public. Invoke and task endpoints require the auth mode configured by `A2A_AUTH_MODE`.
 
 ## JSON-RPC Methods
 
@@ -43,10 +44,21 @@ source .venv/bin/activate
 pip install -r requirements.txt
 export GOOGLE_API_KEY='<your-google-api-key>'
 export GEMINI_MODEL='gemini-3.5-flash'
-export A2A_BASIC_USERNAME='username'
+export A2A_AUTH_MODE='basic'
+export A2A_BASIC_USERNAME='rismohan'
 export A2A_BASIC_PASSWORD='Welcome@123'
 export PUBLIC_BASE_URL='http://localhost:8080'
 uvicorn main:app --host 0.0.0.0 --port 8080
+```
+
+For OAuth 2.0 local testing:
+
+```bash
+export A2A_AUTH_MODE='oauth2'
+export A2A_OAUTH_CLIENT_ID='a2a_client'
+export A2A_OAUTH_CLIENT_SECRET='Welcome@123'
+export A2A_OAUTH_SCOPE='a2a.invoke'
+export A2A_OAUTH_TOKEN_SIGNING_SECRET='change-this-signing-secret'
 ```
 
 ## Render Deployment
@@ -64,11 +76,57 @@ Set environment variables:
 PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
 GOOGLE_API_KEY=<your-google-api-key>
 GEMINI_MODEL=gemini-3.5-flash
-A2A_BASIC_USERNAME=username
+A2A_AUTH_MODE=basic
+A2A_BASIC_USERNAME=rismohan
 A2A_BASIC_PASSWORD=Welcome@123
 ```
 
 Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
+
+### Render OAuth 2.0 Configuration
+
+To test OAuth 2.0 instead of Basic auth, set these Render environment variables:
+
+```text
+PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
+GOOGLE_API_KEY=<your-google-api-key>
+GEMINI_MODEL=gemini-3.5-flash
+A2A_AUTH_MODE=oauth2
+A2A_OAUTH_CLIENT_ID=a2a_client
+A2A_OAUTH_CLIENT_SECRET=<your-client-secret>
+A2A_OAUTH_SCOPE=a2a.invoke
+A2A_OAUTH_TOKEN_SIGNING_SECRET=<long-random-signing-secret>
+A2A_OAUTH_TOKEN_TTL_SECONDS=3600
+```
+
+Keep `A2A_OAUTH_CLIENT_SECRET`, `A2A_OAUTH_TOKEN_SIGNING_SECRET`, and `GOOGLE_API_KEY` as Render secret values.
+
+When `A2A_AUTH_MODE=oauth2`, the public Agent Card advertises an OAuth 2.0 client-credentials security scheme with:
+
+```text
+tokenUrl=https://<your-render-service>.onrender.com/oauth/token
+scope=a2a.invoke
+```
+
+In the connector UI/config, use an OAuth client-credentials profile:
+
+```json
+{
+  "authentication": {
+    "selectedAuthProfile": "oauth2_client_credentials",
+    "tokenUri": "https://<your-render-service>.onrender.com/oauth/token",
+    "clientId": "a2a_client",
+    "clientSecret": "<your-client-secret>",
+    "oauthScopes": "a2a.invoke"
+  }
+}
+```
+
+The gateway should fetch the token from `/oauth/token` and call the A2A invoke/task endpoints with:
+
+```text
+Authorization: Bearer <access_token>
+```
 
 ## Direct Curl Tests
 
@@ -84,11 +142,27 @@ Check health:
 curl 'https://<your-render-service>.onrender.com/health'
 ```
 
+Fetch an OAuth 2.0 access token:
+
+```bash
+TOKEN=$(curl -s -X POST 'https://<your-render-service>.onrender.com/oauth/token' \
+  --user 'a2a_client:<your-client-secret>' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data 'grant_type=client_credentials&scope=a2a.invoke' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+For OAuth mode, replace each `--user 'rismohan:Welcome@123'` example below with:
+
+```bash
+--header "Authorization: Bearer $TOKEN"
+```
+
 Create a Gemini-backed task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -106,7 +180,7 @@ Create the same task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -129,7 +203,7 @@ Create a non-terminal async task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -147,7 +221,7 @@ Create a non-terminal async task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -170,7 +244,7 @@ Create a streamed Gemini-backed task:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/message:stream' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/a2a+json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -189,7 +263,7 @@ Create a streamed Gemini-backed task through JSON-RPC:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -213,14 +287,14 @@ Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
-  --user 'username:Welcome@123'
+  --user 'rismohan:Welcome@123'
 ```
 
 Subscribe to a non-terminal task and complete it:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:subscribe' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Accept: text/event-stream'
 ```
 
@@ -228,7 +302,7 @@ Poll a task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -244,7 +318,7 @@ Subscribe to a non-terminal task through JSON-RPC:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -259,14 +333,14 @@ curl -N -X POST 'https://<your-render-service>.onrender.com/' \
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
-  --user 'username:Welcome@123'
+  --user 'rismohan:Welcome@123'
 ```
 
 List tasks through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -280,7 +354,7 @@ curl -X POST 'https://<your-render-service>.onrender.com/' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -298,14 +372,14 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
-  --user 'username:Welcome@123'
+  --user 'rismohan:Welcome@123'
 ```
 
 Cancel a task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'username:Welcome@123' \
+  --user 'rismohan:Welcome@123' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -344,7 +418,7 @@ Store auth in connector config or vault:
   },
   "authentication": {
     "selectedAuthProfile": "basic_profile",
-    "username": "username",
+    "username": "rismohan",
     "password": "Welcome@123"
   }
 }

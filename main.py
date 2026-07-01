@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import os
 import asyncio
+import base64
+import hashlib
+import hmac
 import json
 import secrets
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from google import genai
 
 
@@ -19,6 +23,10 @@ APP_VERSION = "1.0.0"
 DEFAULT_USERNAME = "a2a_user"
 DEFAULT_PASSWORD = "Welcome1"
 DEFAULT_MODEL = "gemini-3.5-flash"
+DEFAULT_OAUTH_CLIENT_ID = "a2a_client"
+DEFAULT_OAUTH_CLIENT_SECRET = "Welcome1"
+DEFAULT_OAUTH_SCOPE = "a2a.invoke"
+DEFAULT_OAUTH_TOKEN_TTL_SECONDS = 3600
 TERMINAL_TASK_STATES = {
     "TASK_STATE_COMPLETED",
     "TASK_STATE_FAILED",
@@ -27,9 +35,12 @@ TERMINAL_TASK_STATES = {
     "TASK_STATE_REJECTED",
 }
 
-security = HTTPBasic(auto_error=False)
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 TASKS: Dict[str, Dict[str, Any]] = {}
+
+
+def configured_auth_mode() -> str:
+    return os.getenv("A2A_AUTH_MODE", "basic").strip().lower()
 
 
 def configured_username() -> str:
@@ -38,6 +49,32 @@ def configured_username() -> str:
 
 def configured_password() -> str:
     return os.getenv("A2A_BASIC_PASSWORD", DEFAULT_PASSWORD)
+
+
+def configured_oauth_client_id() -> str:
+    return os.getenv("A2A_OAUTH_CLIENT_ID", DEFAULT_OAUTH_CLIENT_ID)
+
+
+def configured_oauth_client_secret() -> str:
+    return os.getenv("A2A_OAUTH_CLIENT_SECRET", DEFAULT_OAUTH_CLIENT_SECRET)
+
+
+def configured_oauth_scope() -> str:
+    return os.getenv("A2A_OAUTH_SCOPE", DEFAULT_OAUTH_SCOPE)
+
+
+def configured_oauth_token_ttl_seconds() -> int:
+    raw_value = os.getenv("A2A_OAUTH_TOKEN_TTL_SECONDS")
+    if not raw_value:
+        return DEFAULT_OAUTH_TOKEN_TTL_SECONDS
+    try:
+        return max(60, int(raw_value))
+    except ValueError:
+        return DEFAULT_OAUTH_TOKEN_TTL_SECONDS
+
+
+def oauth_signing_secret() -> str:
+    return os.getenv("A2A_OAUTH_TOKEN_SIGNING_SECRET") or configured_oauth_client_secret()
 
 
 def configured_model() -> str:
@@ -55,17 +92,63 @@ def public_base_url() -> str:
     return "http://localhost:%s" % os.getenv("PORT", "8080")
 
 
-def require_basic_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> str:
-    if credentials is not None:
-        valid_username = secrets.compare_digest(credentials.username, configured_username())
-        valid_password = secrets.compare_digest(credentials.password, configured_password())
-        if valid_username and valid_password:
-            return credentials.username
+def require_auth(request: Request) -> str:
+    auth_mode = configured_auth_mode()
+    if auth_mode == "basic":
+        return require_basic_auth(request)
+    if auth_mode == "oauth2":
+        return require_bearer_auth(request)
+    if auth_mode == "both":
+        try:
+            return require_bearer_auth(request)
+        except HTTPException:
+            return require_basic_auth(request)
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Unsupported A2A_AUTH_MODE. Use basic, oauth2, or both.",
+    )
+
+
+def require_basic_auth(request: Request) -> str:
+    scheme, value = split_authorization_header(request.headers.get("Authorization"))
+    if scheme == "basic" and value:
+        try:
+            decoded = base64.b64decode(value).decode("utf-8")
+        except Exception:
+            decoded = ""
+        username, separator, password = decoded.partition(":")
+        if separator:
+            valid_username = secrets.compare_digest(username, configured_username())
+            valid_password = secrets.compare_digest(password, configured_password())
+            if valid_username and valid_password:
+                return username
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Basic authentication required",
         headers={"WWW-Authenticate": "Basic"},
     )
+
+
+def require_bearer_auth(request: Request) -> str:
+    scheme, token = split_authorization_header(request.headers.get("Authorization"))
+    if scheme == "bearer" and token:
+        subject = validate_oauth_access_token(token)
+        if subject:
+            return subject
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Bearer token required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def split_authorization_header(value: Optional[str]) -> tuple[str, str]:
+    if not value:
+        return "", ""
+    scheme, separator, credentials = value.strip().partition(" ")
+    if not separator:
+        return "", ""
+    return scheme.lower(), credentials.strip()
 
 
 @app.get("/health")
@@ -76,16 +159,39 @@ def health() -> Dict[str, Any]:
         "version": APP_VERSION,
         "model": configured_model(),
         "googleApiKeyConfigured": bool(configured_google_api_key()),
+        "authMode": configured_auth_mode(),
     }
 
 
 @app.get("/.well-known/agent-card.json")
 def agent_card() -> Dict[str, Any]:
     base_url = public_base_url()
-    security_requirement = {"schemes": {"basic_auth": {"list": []}}}
+    auth_mode = configured_auth_mode()
+    security_scheme_id = "oauth2_client_credentials" if auth_mode == "oauth2" else "basic_auth"
+    security_requirement = {"schemes": {security_scheme_id: {"list": []}}}
+    security_schemes = {
+        "basic_auth": {
+            "httpAuthSecurityScheme": {
+                "description": "HTTP Basic authentication for A2A invocation and task endpoints.",
+                "scheme": "Basic",
+            }
+        }
+    }
+    if auth_mode == "oauth2":
+        security_schemes = {
+            "oauth2_client_credentials": {
+                "oauth2SecurityScheme": {
+                    "description": "OAuth 2.0 client credentials for A2A invocation and task endpoints.",
+                    "tokenUrl": base_url + "/oauth/token",
+                    "scopes": {
+                        configured_oauth_scope(): "Invoke A2A skills and task lifecycle endpoints."
+                    },
+                }
+            }
+        }
     return {
         "name": APP_NAME,
-        "description": "A stateful A2A test agent backed by Google Gemini and HTTP Basic authentication.",
+        "description": "A stateful A2A test agent backed by Google Gemini with selectable Basic or OAuth 2.0 authentication.",
         "version": APP_VERSION,
         "provider": {
             "organization": "A2A Connector POC",
@@ -111,14 +217,7 @@ def agent_card() -> Dict[str, Any]:
                 "protocolVersion": "1.0",
             },
         ],
-        "securitySchemes": {
-            "basic_auth": {
-                "httpAuthSecurityScheme": {
-                    "description": "HTTP Basic authentication for A2A invocation and task endpoints.",
-                    "scheme": "Basic",
-                }
-            }
-        },
+        "securitySchemes": security_schemes,
         "securityRequirements": [security_requirement],
         "skills": [
             {
@@ -164,8 +263,32 @@ def agent_card() -> Dict[str, Any]:
     }
 
 
+@app.post("/oauth/token")
+async def oauth_token(request: Request) -> JSONResponse:
+    client_id, client_secret, scope, grant_type = await parse_client_credentials_request(request)
+    if grant_type != "client_credentials":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
+    if not secrets.compare_digest(client_id, configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    if not secrets.compare_digest(client_secret, configured_oauth_client_secret()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    requested_scope = scope or configured_oauth_scope()
+    allowed_scope = configured_oauth_scope()
+    if requested_scope != allowed_scope:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_scope")
+    ttl_seconds = configured_oauth_token_ttl_seconds()
+    return JSONResponse(
+        {
+            "access_token": create_oauth_access_token(client_id, ttl_seconds),
+            "token_type": "Bearer",
+            "expires_in": ttl_seconds,
+            "scope": allowed_scope,
+        }
+    )
+
+
 @app.post("/")
-async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth)):
+async def jsonrpc_invoke(request: Request, _: str = Depends(require_auth)):
     payload = await request.json()
     request_id = payload.get("id")
     if payload.get("jsonrpc") != "2.0":
@@ -209,13 +332,13 @@ async def jsonrpc_invoke(request: Request, _: str = Depends(require_basic_auth))
 
 
 @app.post("/message:send")
-async def http_json_send_message(request: Request, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+async def http_json_send_message(request: Request, _: str = Depends(require_auth)) -> Dict[str, Any]:
     payload = await request.json()
     return handle_send_message(payload)
 
 
 @app.post("/message:stream")
-async def http_json_stream_message(request: Request, _: str = Depends(require_basic_auth)) -> StreamingResponse:
+async def http_json_stream_message(request: Request, _: str = Depends(require_auth)) -> StreamingResponse:
     payload = await request.json()
     return StreamingResponse(
         stream_send_message(payload),
@@ -225,22 +348,22 @@ async def http_json_stream_message(request: Request, _: str = Depends(require_ba
 
 
 @app.get("/tasks/{task_id}")
-def get_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+def get_task(task_id: str, _: str = Depends(require_auth)) -> Dict[str, Any]:
     return get_task_payload(task_id)
 
 
 @app.get("/tasks")
-def list_tasks(contextId: Optional[str] = None, _: str = Depends(require_basic_auth)) -> List[Dict[str, Any]]:
+def list_tasks(contextId: Optional[str] = None, _: str = Depends(require_auth)) -> List[Dict[str, Any]]:
     return list_tasks_payload(contextId)
 
 
 @app.post("/tasks/{task_id}:cancel")
-def cancel_task(task_id: str, _: str = Depends(require_basic_auth)) -> Dict[str, Any]:
+def cancel_task(task_id: str, _: str = Depends(require_auth)) -> Dict[str, Any]:
     return cancel_task_payload(task_id)
 
 
 @app.post("/tasks/{task_id}:subscribe")
-async def subscribe_task(task_id: str, _: str = Depends(require_basic_auth)) -> StreamingResponse:
+async def subscribe_task(task_id: str, _: str = Depends(require_auth)) -> StreamingResponse:
     task = TASKS.get(task_id)
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
@@ -288,6 +411,84 @@ def jsonrpc_sse_error(request_id: Any, code: int, message: str) -> StreamingResp
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+async def parse_client_credentials_request(request: Request) -> tuple[str, str, str, str]:
+    scheme, credentials = split_authorization_header(request.headers.get("Authorization"))
+    body = await request.body()
+    form = urllib.parse.parse_qs(body.decode("utf-8")) if body else {}
+    client_id = first_form_value(form, "client_id")
+    client_secret = first_form_value(form, "client_secret")
+    if scheme == "basic" and credentials:
+        try:
+            decoded = base64.b64decode(credentials).decode("utf-8")
+        except Exception:
+            decoded = ""
+        basic_client_id, separator, basic_client_secret = decoded.partition(":")
+        if separator:
+            client_id = urllib.parse.unquote(basic_client_id)
+            client_secret = urllib.parse.unquote(basic_client_secret)
+    return (
+        client_id,
+        client_secret,
+        first_form_value(form, "scope"),
+        first_form_value(form, "grant_type") or "client_credentials",
+    )
+
+
+def first_form_value(form: Dict[str, List[str]], key: str) -> str:
+    values = form.get(key) or []
+    return values[0] if values else ""
+
+
+def create_oauth_access_token(subject: str, ttl_seconds: int) -> str:
+    expires_at = int(time.time()) + ttl_seconds
+    nonce = secrets.token_urlsafe(12)
+    payload = "%s:%s:%s" % (subject, expires_at, nonce)
+    signature = hmac.new(
+        oauth_signing_secret().encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return "%s.%s" % (
+        base64url_encode(payload.encode("utf-8")),
+        base64url_encode(signature),
+    )
+
+
+def validate_oauth_access_token(token: str) -> Optional[str]:
+    payload_part, separator, signature_part = token.partition(".")
+    if not separator:
+        return None
+    try:
+        payload_bytes = base64url_decode(payload_part)
+        supplied_signature = base64url_decode(signature_part)
+    except Exception:
+        return None
+    expected_signature = hmac.new(
+        oauth_signing_secret().encode("utf-8"),
+        payload_bytes,
+        hashlib.sha256,
+    ).digest()
+    if not hmac.compare_digest(supplied_signature, expected_signature):
+        return None
+    try:
+        payload = payload_bytes.decode("utf-8")
+        subject, expires_at, _nonce = payload.split(":", 2)
+        if int(expires_at) < int(time.time()):
+            return None
+        return subject
+    except Exception:
+        return None
+
+
+def base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def base64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
 
 
 def normalize_jsonrpc_method(method: Any) -> str:
