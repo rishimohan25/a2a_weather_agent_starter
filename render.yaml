@@ -13,7 +13,7 @@ services:
       - key: GEMINI_MODEL
         value: gemini-3.5-flash
       - key: A2A_AUTH_MODE
-        value: basic
+        value: all
       - key: A2A_BASIC_USERNAME
         value: a2a_user
       - key: A2A_BASIC_PASSWORD

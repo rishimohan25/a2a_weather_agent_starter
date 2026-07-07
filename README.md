@@ -25,6 +25,7 @@ Set `A2A_AUTH_MODE` to one of these values:
 
 | Mode | Agent Card scheme | Invocation credential |
 | --- | --- | --- |
+| `all` | All supported test schemes | Any configured supported credential |
 | `none` | No security requirement | No auth header or parameter |
 | `basic` | `httpAuthSecurityScheme`, `Basic` | `Authorization: Basic ...` |
 | `bearer_token` | `httpAuthSecurityScheme`, `Bearer` | `Authorization: Bearer <token>` |
@@ -164,6 +165,25 @@ A2A_BASIC_PASSWORD=<your-basic-password>
 ```
 
 Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
+
+To make the Agent Card advertise every supported test auth scheme at once, use:
+
+```text
+A2A_AUTH_MODE=all
+A2A_BASIC_USERNAME=<your-basic-username>
+A2A_BASIC_PASSWORD=<your-basic-password>
+A2A_BEARER_TOKEN=<your-bearer-token>
+A2A_API_KEY_NAME=X-API-Key
+A2A_API_KEY_VALUE=<your-api-key>
+A2A_OAUTH_CLIENT_ID=a2a_client
+A2A_OAUTH_CLIENT_SECRET=<your-client-secret>
+A2A_OAUTH_SCOPE=a2a.invoke
+A2A_OAUTH_TOKEN_SIGNING_SECRET=<long-random-signing-secret>
+A2A_OAUTH_ALLOWED_REDIRECT_URIS=https://<gateway-host>/v2/mcpGateway/auth/callback,https://<gateway-host>/v2/mcpGateway/contentIntelligence/auth/callback
+A2A_MTLS_CLIENT_CERT_FINGERPRINT=<your-client-cert-fingerprint>
+```
+
+In `all` mode the Agent Card includes Basic, Bearer, API key header/query/cookie, OAuth client credentials, OAuth authorization code with PKCE, OAuth device code, OIDC, and mTLS schemes. The invoke endpoints accept any one of the configured credentials.
 
 ### Render Auth Mode Configuration
 

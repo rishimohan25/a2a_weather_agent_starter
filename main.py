@@ -151,6 +151,8 @@ def public_base_url() -> str:
 
 def require_auth(request: Request) -> str:
     auth_mode = configured_auth_mode()
+    if auth_mode == "all":
+        return require_any_supported_auth(request)
     if auth_mode == "none":
         return "anonymous"
     if auth_mode == "basic":
@@ -176,7 +178,7 @@ def require_auth(request: Request) -> str:
             return require_basic_auth(request)
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="Unsupported A2A_AUTH_MODE. Use none, basic, bearer_token, api_key_header, api_key_query, api_key_cookie, oauth2, oauth2_authorization_code_pkce, oauth2_device_code, oidc, mtls, or both.",
+        detail="Unsupported A2A_AUTH_MODE. Use all, none, basic, bearer_token, api_key_header, api_key_query, api_key_cookie, oauth2, oauth2_authorization_code_pkce, oauth2_device_code, oidc, mtls, or both.",
     )
 
 
@@ -252,6 +254,23 @@ def require_mtls_auth(request: Request) -> str:
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Client certificate fingerprint required")
 
 
+def require_any_supported_auth(request: Request) -> str:
+    for auth_checker in (
+        require_basic_auth,
+        require_bearer_auth,
+        require_static_bearer_auth,
+        require_api_key_header_auth,
+        require_api_key_query_auth,
+        require_api_key_cookie_auth,
+        require_mtls_auth,
+    ):
+        try:
+            return auth_checker(request)
+        except HTTPException:
+            continue
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Supported A2A authentication required")
+
+
 def split_authorization_header(value: Optional[str]) -> tuple[str, str]:
     if not value:
         return "", ""
@@ -298,14 +317,8 @@ def openid_configuration() -> Dict[str, Any]:
 def agent_card() -> Dict[str, Any]:
     base_url = public_base_url()
     auth_mode = configured_auth_mode()
-    security_scheme_id = oauth_security_scheme_id(auth_mode)
-    security_requirement = (
-        {"schemes": {security_scheme_id: {"list": []}}}
-        if auth_mode != "none"
-        else None
-    )
     security_schemes = oauth_security_schemes(auth_mode, base_url)
-    security_requirements = [security_requirement] if security_requirement else []
+    security_requirements = oauth_security_requirements(auth_mode)
     return {
         "name": APP_NAME,
         "description": "A stateful A2A test agent backed by Google Gemini with selectable Basic or OAuth 2.0 authentication.",
@@ -404,7 +417,50 @@ def oauth_security_scheme_id(auth_mode: str) -> str:
     return "basic_auth"
 
 
+def oauth_security_requirements(auth_mode: str) -> List[Dict[str, Any]]:
+    if auth_mode == "none":
+        return []
+    if auth_mode == "all":
+        return [
+            {"schemes": {scheme_id: {"list": []}}}
+            for scheme_id in all_security_scheme_ids()
+        ]
+    security_scheme_id = oauth_security_scheme_id(auth_mode)
+    return [{"schemes": {security_scheme_id: {"list": []}}}] if security_scheme_id else []
+
+
+def all_security_scheme_ids() -> List[str]:
+    return [
+        "basic_auth",
+        "bearer_token",
+        "api_key_header",
+        "api_key_query",
+        "api_key_cookie",
+        "oauth2_client_credentials",
+        "oauth2_authorization_code_pkce",
+        "oauth2_device_code",
+        "oidc",
+        "mtls",
+    ]
+
+
 def oauth_security_schemes(auth_mode: str, base_url: str) -> Dict[str, Any]:
+    if auth_mode == "all":
+        schemes: Dict[str, Any] = {}
+        for mode in (
+            "basic",
+            "bearer_token",
+            "api_key_header",
+            "api_key_query",
+            "api_key_cookie",
+            "oauth2",
+            "oauth2_authorization_code_pkce",
+            "oauth2_device_code",
+            "oidc",
+            "mtls",
+        ):
+            schemes.update(oauth_security_schemes(mode, base_url))
+        return schemes
     if auth_mode == "none":
         return {}
     if auth_mode == "bearer_token":
@@ -538,7 +594,7 @@ def oauth_authorize(
     code_challenge: str,
     code_challenge_method: str,
 ) -> RedirectResponse:
-    if configured_auth_mode() != "oauth2_authorization_code_pkce":
+    if configured_auth_mode() not in ("oauth2_authorization_code_pkce", "all"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="authorization_code_not_enabled")
     if response_type != "code":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_response_type")
@@ -597,7 +653,7 @@ async def oauth_token(request: Request) -> JSONResponse:
 
 @app.post("/oauth/device_authorize")
 async def oauth_device_authorize(request: Request) -> JSONResponse:
-    if configured_auth_mode() != "oauth2_device_code":
+    if configured_auth_mode() not in ("oauth2_device_code", "all"):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="device_code_not_enabled")
     token_request = await parse_oauth_token_request(request)
     if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
@@ -794,7 +850,7 @@ def validate_client_credentials_token_request(token_request: Dict[str, str]) -> 
 
 
 def validate_authorization_code_token_request(token_request: Dict[str, str]) -> str:
-    if configured_auth_mode() != "oauth2_authorization_code_pkce":
+    if configured_auth_mode() not in ("oauth2_authorization_code_pkce", "all"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
     if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
@@ -820,7 +876,7 @@ def validate_authorization_code_token_request(token_request: Dict[str, str]) -> 
 
 
 def validate_device_code_token_request(token_request: Dict[str, str]) -> str:
-    if configured_auth_mode() != "oauth2_device_code":
+    if configured_auth_mode() not in ("oauth2_device_code", "all"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
     if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
