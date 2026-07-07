@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from google import genai
 
 
@@ -27,6 +27,12 @@ DEFAULT_OAUTH_CLIENT_ID = "a2a_client"
 DEFAULT_OAUTH_CLIENT_SECRET = "Welcome1"
 DEFAULT_OAUTH_SCOPE = "a2a.invoke"
 DEFAULT_OAUTH_TOKEN_TTL_SECONDS = 3600
+DEFAULT_OAUTH_CODE_TTL_SECONDS = 300
+DEFAULT_API_KEY_NAME = "X-API-Key"
+DEFAULT_API_KEY_VALUE = "change-this-api-key"
+DEFAULT_BEARER_TOKEN = "change-this-bearer-token"
+DEFAULT_MTLS_FINGERPRINT = "change-this-client-cert-fingerprint"
+DEFAULT_OAUTH_DEVICE_CODE_TTL_SECONDS = 600
 TERMINAL_TASK_STATES = {
     "TASK_STATE_COMPLETED",
     "TASK_STATE_FAILED",
@@ -37,6 +43,8 @@ TERMINAL_TASK_STATES = {
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
 TASKS: Dict[str, Dict[str, Any]] = {}
+AUTHORIZATION_CODES: Dict[str, Dict[str, Any]] = {}
+DEVICE_CODES: Dict[str, Dict[str, Any]] = {}
 
 
 def configured_auth_mode() -> str:
@@ -49,6 +57,18 @@ def configured_username() -> str:
 
 def configured_password() -> str:
     return os.getenv("A2A_BASIC_PASSWORD", DEFAULT_PASSWORD)
+
+
+def configured_api_key_name() -> str:
+    return os.getenv("A2A_API_KEY_NAME", DEFAULT_API_KEY_NAME)
+
+
+def configured_api_key_value() -> str:
+    return os.getenv("A2A_API_KEY_VALUE", DEFAULT_API_KEY_VALUE)
+
+
+def configured_bearer_token() -> str:
+    return os.getenv("A2A_BEARER_TOKEN", DEFAULT_BEARER_TOKEN)
 
 
 def configured_oauth_client_id() -> str:
@@ -73,6 +93,43 @@ def configured_oauth_token_ttl_seconds() -> int:
         return DEFAULT_OAUTH_TOKEN_TTL_SECONDS
 
 
+def configured_oauth_code_ttl_seconds() -> int:
+    raw_value = os.getenv("A2A_OAUTH_CODE_TTL_SECONDS")
+    if not raw_value:
+        return DEFAULT_OAUTH_CODE_TTL_SECONDS
+    try:
+        return max(60, int(raw_value))
+    except ValueError:
+        return DEFAULT_OAUTH_CODE_TTL_SECONDS
+
+
+def configured_oauth_device_code_ttl_seconds() -> int:
+    raw_value = os.getenv("A2A_OAUTH_DEVICE_CODE_TTL_SECONDS")
+    if not raw_value:
+        return DEFAULT_OAUTH_DEVICE_CODE_TTL_SECONDS
+    try:
+        return max(60, int(raw_value))
+    except ValueError:
+        return DEFAULT_OAUTH_DEVICE_CODE_TTL_SECONDS
+
+
+def configured_oauth_allowed_redirect_uris() -> set[str]:
+    raw_value = os.getenv("A2A_OAUTH_ALLOWED_REDIRECT_URIS", "")
+    return {
+        item.strip()
+        for item in raw_value.split(",")
+        if item.strip()
+    }
+
+
+def configured_oidc_discovery_url() -> str:
+    return os.getenv("A2A_OIDC_DISCOVERY_URL", public_base_url() + "/.well-known/openid-configuration")
+
+
+def configured_mtls_fingerprint() -> str:
+    return os.getenv("A2A_MTLS_CLIENT_CERT_FINGERPRINT", DEFAULT_MTLS_FINGERPRINT)
+
+
 def oauth_signing_secret() -> str:
     return os.getenv("A2A_OAUTH_TOKEN_SIGNING_SECRET") or configured_oauth_client_secret()
 
@@ -94,10 +151,24 @@ def public_base_url() -> str:
 
 def require_auth(request: Request) -> str:
     auth_mode = configured_auth_mode()
+    if auth_mode == "none":
+        return "anonymous"
     if auth_mode == "basic":
         return require_basic_auth(request)
-    if auth_mode == "oauth2":
+    if auth_mode == "bearer_token":
+        return require_static_bearer_auth(request)
+    if auth_mode == "api_key_header":
+        return require_api_key_header_auth(request)
+    if auth_mode == "api_key_query":
+        return require_api_key_query_auth(request)
+    if auth_mode == "api_key_cookie":
+        return require_api_key_cookie_auth(request)
+    if auth_mode in ("oauth2", "oauth2_authorization_code_pkce", "oauth2_device_code"):
         return require_bearer_auth(request)
+    if auth_mode == "oidc":
+        return require_static_bearer_auth(request)
+    if auth_mode == "mtls":
+        return require_mtls_auth(request)
     if auth_mode == "both":
         try:
             return require_bearer_auth(request)
@@ -105,7 +176,7 @@ def require_auth(request: Request) -> str:
             return require_basic_auth(request)
     raise HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="Unsupported A2A_AUTH_MODE. Use basic, oauth2, or both.",
+        detail="Unsupported A2A_AUTH_MODE. Use none, basic, bearer_token, api_key_header, api_key_query, api_key_cookie, oauth2, oauth2_authorization_code_pkce, oauth2_device_code, oidc, mtls, or both.",
     )
 
 
@@ -142,6 +213,45 @@ def require_bearer_auth(request: Request) -> str:
     )
 
 
+def require_static_bearer_auth(request: Request) -> str:
+    scheme, token = split_authorization_header(request.headers.get("Authorization"))
+    if scheme == "bearer" and token and secrets.compare_digest(token, configured_bearer_token()):
+        return "bearer-token-client"
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Bearer token required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_api_key_header_auth(request: Request) -> str:
+    supplied = request.headers.get(configured_api_key_name())
+    if supplied and secrets.compare_digest(supplied, configured_api_key_value()):
+        return "api-key-header-client"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key header required")
+
+
+def require_api_key_query_auth(request: Request) -> str:
+    supplied = request.query_params.get(configured_api_key_name())
+    if supplied and secrets.compare_digest(supplied, configured_api_key_value()):
+        return "api-key-query-client"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key query parameter required")
+
+
+def require_api_key_cookie_auth(request: Request) -> str:
+    supplied = request.cookies.get(configured_api_key_name())
+    if supplied and secrets.compare_digest(supplied, configured_api_key_value()):
+        return "api-key-cookie-client"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key cookie required")
+
+
+def require_mtls_auth(request: Request) -> str:
+    supplied = request.headers.get("X-Client-Cert-Fingerprint")
+    if supplied and secrets.compare_digest(supplied, configured_mtls_fingerprint()):
+        return "mtls-client"
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Client certificate fingerprint required")
+
+
 def split_authorization_header(value: Optional[str]) -> tuple[str, str]:
     if not value:
         return "", ""
@@ -160,6 +270,27 @@ def health() -> Dict[str, Any]:
         "model": configured_model(),
         "googleApiKeyConfigured": bool(configured_google_api_key()),
         "authMode": configured_auth_mode(),
+        "oauthAllowedRedirectUriCount": len(configured_oauth_allowed_redirect_uris()),
+    }
+
+
+@app.get("/.well-known/openid-configuration")
+def openid_configuration() -> Dict[str, Any]:
+    base_url = public_base_url()
+    return {
+        "issuer": base_url,
+        "authorization_endpoint": base_url + "/oauth/authorize",
+        "token_endpoint": base_url + "/oauth/token",
+        "scopes_supported": [configured_oauth_scope()],
+        "response_types_supported": ["code"],
+        "grant_types_supported": [
+            "authorization_code",
+            "client_credentials",
+            "urn:ietf:params:oauth:grant-type:device_code",
+        ],
+        "device_authorization_endpoint": base_url + "/oauth/device_authorize",
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
     }
 
 
@@ -167,28 +298,14 @@ def health() -> Dict[str, Any]:
 def agent_card() -> Dict[str, Any]:
     base_url = public_base_url()
     auth_mode = configured_auth_mode()
-    security_scheme_id = "oauth2_client_credentials" if auth_mode == "oauth2" else "basic_auth"
-    security_requirement = {"schemes": {security_scheme_id: {"list": []}}}
-    security_schemes = {
-        "basic_auth": {
-            "httpAuthSecurityScheme": {
-                "description": "HTTP Basic authentication for A2A invocation and task endpoints.",
-                "scheme": "Basic",
-            }
-        }
-    }
-    if auth_mode == "oauth2":
-        security_schemes = {
-            "oauth2_client_credentials": {
-                "oauth2SecurityScheme": {
-                    "description": "OAuth 2.0 client credentials for A2A invocation and task endpoints.",
-                    "tokenUrl": base_url + "/oauth/token",
-                    "scopes": {
-                        configured_oauth_scope(): "Invoke A2A skills and task lifecycle endpoints."
-                    },
-                }
-            }
-        }
+    security_scheme_id = oauth_security_scheme_id(auth_mode)
+    security_requirement = (
+        {"schemes": {security_scheme_id: {"list": []}}}
+        if auth_mode != "none"
+        else None
+    )
+    security_schemes = oauth_security_schemes(auth_mode, base_url)
+    security_requirements = [security_requirement] if security_requirement else []
     return {
         "name": APP_NAME,
         "description": "A stateful A2A test agent backed by Google Gemini with selectable Basic or OAuth 2.0 authentication.",
@@ -218,7 +335,7 @@ def agent_card() -> Dict[str, Any]:
             },
         ],
         "securitySchemes": security_schemes,
-        "securityRequirements": [security_requirement],
+        "securityRequirements": security_requirements,
         "skills": [
             {
                 "id": "llm_chat",
@@ -231,7 +348,7 @@ def agent_card() -> Dict[str, Any]:
                 ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
-                "securityRequirements": [security_requirement],
+                "securityRequirements": security_requirements,
             },
             {
                 "id": "llm_summarize",
@@ -244,7 +361,7 @@ def agent_card() -> Dict[str, Any]:
                 ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
-                "securityRequirements": [security_requirement],
+                "securityRequirements": security_requirements,
             },
             {
                 "id": "llm_extract_actions",
@@ -257,32 +374,257 @@ def agent_card() -> Dict[str, Any]:
                 ],
                 "inputModes": ["text/plain", "application/json"],
                 "outputModes": ["text/plain", "application/json"],
-                "securityRequirements": [security_requirement],
+                "securityRequirements": security_requirements,
             },
         ],
     }
 
 
+def oauth_security_scheme_id(auth_mode: str) -> str:
+    if auth_mode == "none":
+        return ""
+    if auth_mode == "bearer_token":
+        return "bearer_token"
+    if auth_mode == "api_key_header":
+        return "api_key_header"
+    if auth_mode == "api_key_query":
+        return "api_key_query"
+    if auth_mode == "api_key_cookie":
+        return "api_key_cookie"
+    if auth_mode == "oauth2":
+        return "oauth2_client_credentials"
+    if auth_mode == "oauth2_authorization_code_pkce":
+        return "oauth2_authorization_code_pkce"
+    if auth_mode == "oauth2_device_code":
+        return "oauth2_device_code"
+    if auth_mode == "oidc":
+        return "oidc"
+    if auth_mode == "mtls":
+        return "mtls"
+    return "basic_auth"
+
+
+def oauth_security_schemes(auth_mode: str, base_url: str) -> Dict[str, Any]:
+    if auth_mode == "none":
+        return {}
+    if auth_mode == "bearer_token":
+        return {
+            "bearer_token": {
+                "httpAuthSecurityScheme": {
+                    "description": "Static bearer token authentication for A2A invocation and task endpoints.",
+                    "scheme": "Bearer",
+                    "bearerFormat": "opaque",
+                }
+            }
+        }
+    if auth_mode == "api_key_header":
+        return {
+            "api_key_header": {
+                "apiKeySecurityScheme": {
+                    "description": "API key authentication using a request header.",
+                    "location": "header",
+                    "name": configured_api_key_name(),
+                }
+            }
+        }
+    if auth_mode == "api_key_query":
+        return {
+            "api_key_query": {
+                "apiKeySecurityScheme": {
+                    "description": "API key authentication using a query parameter.",
+                    "location": "query",
+                    "name": configured_api_key_name(),
+                }
+            }
+        }
+    if auth_mode == "api_key_cookie":
+        return {
+            "api_key_cookie": {
+                "apiKeySecurityScheme": {
+                    "description": "API key authentication using a cookie.",
+                    "location": "cookie",
+                    "name": configured_api_key_name(),
+                }
+            }
+        }
+    if auth_mode == "oauth2":
+        return {
+            "oauth2_client_credentials": {
+                "oauth2SecurityScheme": {
+                    "description": "OAuth 2.0 client credentials for A2A invocation and task endpoints.",
+                    "flows": {
+                        "clientCredentials": {
+                            "tokenUrl": base_url + "/oauth/token",
+                            "scopes": {
+                                configured_oauth_scope(): "Invoke A2A skills and task lifecycle endpoints."
+                            },
+                        }
+                    },
+                    "oauth2MetadataUrl": base_url + "/.well-known/openid-configuration",
+                }
+            }
+        }
+    if auth_mode == "oauth2_authorization_code_pkce":
+        return {
+            "oauth2_authorization_code_pkce": {
+                "oauth2SecurityScheme": {
+                    "description": "OAuth 2.0 authorization code with PKCE for A2A invocation and task endpoints.",
+                    "flows": {
+                        "authorizationCode": {
+                            "authorizationUrl": base_url + "/oauth/authorize",
+                            "tokenUrl": base_url + "/oauth/token",
+                            "scopes": {
+                                configured_oauth_scope(): "Invoke A2A skills and task lifecycle endpoints."
+                            },
+                            "pkceRequired": True,
+                        }
+                    },
+                    "oauth2MetadataUrl": base_url + "/.well-known/openid-configuration",
+                }
+            }
+        }
+    if auth_mode == "oauth2_device_code":
+        return {
+            "oauth2_device_code": {
+                "oauth2SecurityScheme": {
+                    "description": "OAuth 2.0 device code flow for A2A invocation and task endpoints.",
+                    "flows": {
+                        "deviceCode": {
+                            "deviceAuthorizationUrl": base_url + "/oauth/device_authorize",
+                            "tokenUrl": base_url + "/oauth/token",
+                            "scopes": {
+                                configured_oauth_scope(): "Invoke A2A skills and task lifecycle endpoints."
+                            },
+                        }
+                    },
+                    "oauth2MetadataUrl": base_url + "/.well-known/openid-configuration",
+                }
+            }
+        }
+    if auth_mode == "oidc":
+        return {
+            "oidc": {
+                "openIdConnectSecurityScheme": {
+                    "description": "OpenID Connect discovery for A2A invocation and task endpoints.",
+                    "openIdConnectUrl": configured_oidc_discovery_url(),
+                }
+            }
+        }
+    if auth_mode == "mtls":
+        return {
+            "mtls": {
+                "mtlsSecurityScheme": {
+                    "description": "Mutual TLS authentication. On Render this test fixture validates X-Client-Cert-Fingerprint because TLS is terminated before the app.",
+                }
+            }
+        }
+    return {
+        "basic_auth": {
+            "httpAuthSecurityScheme": {
+                "description": "HTTP Basic authentication for A2A invocation and task endpoints.",
+                "scheme": "Basic",
+            }
+        }
+    }
+
+
+@app.get("/oauth/authorize")
+def oauth_authorize(
+    response_type: str,
+    client_id: str,
+    redirect_uri: str,
+    scope: str,
+    state: str,
+    code_challenge: str,
+    code_challenge_method: str,
+) -> RedirectResponse:
+    if configured_auth_mode() != "oauth2_authorization_code_pkce":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="authorization_code_not_enabled")
+    if response_type != "code":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_response_type")
+    if not secrets.compare_digest(client_id, configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_client")
+    if not is_allowed_redirect_uri(redirect_uri):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_redirect_uri")
+    if scope != configured_oauth_scope():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_scope")
+    if code_challenge_method != "S256":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_code_challenge_method")
+    if not code_challenge:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_code_challenge")
+
+    cleanup_expired_authorization_codes()
+    code = secrets.token_urlsafe(32)
+    AUTHORIZATION_CODES[code] = {
+        "clientId": client_id,
+        "redirectUri": redirect_uri,
+        "scope": scope,
+        "codeChallenge": code_challenge,
+        "expiresAt": int(time.time()) + configured_oauth_code_ttl_seconds(),
+        "used": False,
+    }
+    separator = "&" if "?" in redirect_uri else "?"
+    location = (
+        redirect_uri
+        + separator
+        + urllib.parse.urlencode({"code": code, "state": state})
+    )
+    return RedirectResponse(location, status_code=status.HTTP_302_FOUND)
+
+
 @app.post("/oauth/token")
 async def oauth_token(request: Request) -> JSONResponse:
-    client_id, client_secret, scope, grant_type = await parse_client_credentials_request(request)
-    if grant_type != "client_credentials":
+    token_request = await parse_oauth_token_request(request)
+    grant_type = token_request["grantType"] or "client_credentials"
+    if grant_type == "client_credentials":
+        subject = validate_client_credentials_token_request(token_request)
+    elif grant_type == "authorization_code":
+        subject = validate_authorization_code_token_request(token_request)
+    elif grant_type == "urn:ietf:params:oauth:grant-type:device_code":
+        subject = validate_device_code_token_request(token_request)
+    else:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
-    if not secrets.compare_digest(client_id, configured_oauth_client_id()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
-    if not secrets.compare_digest(client_secret, configured_oauth_client_secret()):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
-    requested_scope = scope or configured_oauth_scope()
-    allowed_scope = configured_oauth_scope()
-    if requested_scope != allowed_scope:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_scope")
     ttl_seconds = configured_oauth_token_ttl_seconds()
     return JSONResponse(
         {
-            "access_token": create_oauth_access_token(client_id, ttl_seconds),
+            "access_token": create_oauth_access_token(subject, ttl_seconds),
             "token_type": "Bearer",
             "expires_in": ttl_seconds,
-            "scope": allowed_scope,
+            "scope": configured_oauth_scope(),
+        }
+    )
+
+
+@app.post("/oauth/device_authorize")
+async def oauth_device_authorize(request: Request) -> JSONResponse:
+    if configured_auth_mode() != "oauth2_device_code":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="device_code_not_enabled")
+    token_request = await parse_oauth_token_request(request)
+    if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    requested_scope = token_request["scope"] or configured_oauth_scope()
+    if requested_scope != configured_oauth_scope():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_scope")
+
+    cleanup_expired_device_codes()
+    device_code = secrets.token_urlsafe(32)
+    user_code = secrets.token_urlsafe(6).upper().replace("_", "-")
+    expires_at = int(time.time()) + configured_oauth_device_code_ttl_seconds()
+    DEVICE_CODES[device_code] = {
+        "clientId": token_request["clientId"],
+        "scope": requested_scope,
+        "expiresAt": expires_at,
+        "used": False,
+        "authorized": True,
+    }
+    return JSONResponse(
+        {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": public_base_url() + "/oauth/device",
+            "verification_uri_complete": public_base_url() + "/oauth/device?user_code=" + urllib.parse.quote(user_code),
+            "expires_in": configured_oauth_device_code_ttl_seconds(),
+            "interval": 1,
         }
     )
 
@@ -413,7 +755,7 @@ def jsonrpc_sse_error(request_id: Any, code: int, message: str) -> StreamingResp
     )
 
 
-async def parse_client_credentials_request(request: Request) -> tuple[str, str, str, str]:
+async def parse_oauth_token_request(request: Request) -> Dict[str, str]:
     scheme, credentials = split_authorization_header(request.headers.get("Authorization"))
     body = await request.body()
     form = urllib.parse.parse_qs(body.decode("utf-8")) if body else {}
@@ -428,12 +770,111 @@ async def parse_client_credentials_request(request: Request) -> tuple[str, str, 
         if separator:
             client_id = urllib.parse.unquote(basic_client_id)
             client_secret = urllib.parse.unquote(basic_client_secret)
-    return (
-        client_id,
-        client_secret,
-        first_form_value(form, "scope"),
-        first_form_value(form, "grant_type") or "client_credentials",
-    )
+    return {
+        "clientId": client_id,
+        "clientSecret": client_secret,
+        "scope": first_form_value(form, "scope"),
+        "grantType": first_form_value(form, "grant_type") or "client_credentials",
+        "code": first_form_value(form, "code"),
+        "redirectUri": first_form_value(form, "redirect_uri"),
+        "codeVerifier": first_form_value(form, "code_verifier"),
+        "deviceCode": first_form_value(form, "device_code"),
+    }
+
+
+def validate_client_credentials_token_request(token_request: Dict[str, str]) -> str:
+    if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    if not secrets.compare_digest(token_request["clientSecret"], configured_oauth_client_secret()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    requested_scope = token_request["scope"] or configured_oauth_scope()
+    if requested_scope != configured_oauth_scope():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_scope")
+    return token_request["clientId"]
+
+
+def validate_authorization_code_token_request(token_request: Dict[str, str]) -> str:
+    if configured_auth_mode() != "oauth2_authorization_code_pkce":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
+    if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    code = token_request["code"]
+    authorization_code = AUTHORIZATION_CODES.get(code)
+    if not authorization_code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if authorization_code.get("used"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if int(authorization_code.get("expiresAt") or 0) < int(time.time()):
+        AUTHORIZATION_CODES.pop(code, None)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if not secrets.compare_digest(authorization_code["clientId"], token_request["clientId"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if not secrets.compare_digest(authorization_code["redirectUri"], token_request["redirectUri"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if not verify_pkce_code_challenge(token_request["codeVerifier"], authorization_code["codeChallenge"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+
+    authorization_code["used"] = True
+    AUTHORIZATION_CODES.pop(code, None)
+    return token_request["clientId"]
+
+
+def validate_device_code_token_request(token_request: Dict[str, str]) -> str:
+    if configured_auth_mode() != "oauth2_device_code":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unsupported_grant_type")
+    if not secrets.compare_digest(token_request["clientId"], configured_oauth_client_id()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_client")
+    device_code = DEVICE_CODES.get(token_request["deviceCode"])
+    if not device_code:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if device_code.get("used"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+    if int(device_code.get("expiresAt") or 0) < int(time.time()):
+        DEVICE_CODES.pop(token_request["deviceCode"], None)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="expired_token")
+    if not device_code.get("authorized"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="authorization_pending")
+    if not secrets.compare_digest(device_code["clientId"], token_request["clientId"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="invalid_grant")
+
+    device_code["used"] = True
+    DEVICE_CODES.pop(token_request["deviceCode"], None)
+    return token_request["clientId"]
+
+
+def is_allowed_redirect_uri(redirect_uri: str) -> bool:
+    allowed_redirect_uris = configured_oauth_allowed_redirect_uris()
+    return bool(redirect_uri and redirect_uri in allowed_redirect_uris)
+
+
+def verify_pkce_code_challenge(code_verifier: str, code_challenge: str) -> bool:
+    if not code_verifier or not code_challenge:
+        return False
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    expected = base64url_encode(digest)
+    return secrets.compare_digest(expected, code_challenge)
+
+
+def cleanup_expired_authorization_codes() -> None:
+    now = int(time.time())
+    expired_codes = [
+        code
+        for code, authorization_code in AUTHORIZATION_CODES.items()
+        if int(authorization_code.get("expiresAt") or 0) < now
+    ]
+    for code in expired_codes:
+        AUTHORIZATION_CODES.pop(code, None)
+
+
+def cleanup_expired_device_codes() -> None:
+    now = int(time.time())
+    expired_codes = [
+        code
+        for code, device_code in DEVICE_CODES.items()
+        if int(device_code.get("expiresAt") or 0) < now
+    ]
+    for code in expired_codes:
+        DEVICE_CODES.pop(code, None)
 
 
 def first_form_value(form: Dict[str, List[str]], key: str) -> str:

@@ -18,6 +18,12 @@ services:
         value: a2a_user
       - key: A2A_BASIC_PASSWORD
         sync: false
+      - key: A2A_BEARER_TOKEN
+        sync: false
+      - key: A2A_API_KEY_NAME
+        value: X-API-Key
+      - key: A2A_API_KEY_VALUE
+        sync: false
       - key: A2A_OAUTH_CLIENT_ID
         value: a2a_client
       - key: A2A_OAUTH_CLIENT_SECRET
@@ -25,4 +31,16 @@ services:
       - key: A2A_OAUTH_SCOPE
         value: a2a.invoke
       - key: A2A_OAUTH_TOKEN_SIGNING_SECRET
+        sync: false
+      - key: A2A_OAUTH_TOKEN_TTL_SECONDS
+        value: "3600"
+      - key: A2A_OAUTH_CODE_TTL_SECONDS
+        value: "300"
+      - key: A2A_OAUTH_DEVICE_CODE_TTL_SECONDS
+        value: "600"
+      - key: A2A_OAUTH_ALLOWED_REDIRECT_URIS
+        sync: false
+      - key: A2A_OIDC_DISCOVERY_URL
+        sync: false
+      - key: A2A_MTLS_CLIENT_CERT_FINGERPRINT
         sync: false

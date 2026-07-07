@@ -1,12 +1,14 @@
 # A2A Gemini LLM Agent
 
-A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Card, selectable Basic or OAuth 2.0 protected invocation, and stateful task endpoints for gateway task lifecycle testing.
+A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Card, selectable auth modes, and stateful task endpoints for gateway task lifecycle testing.
 
 ## Endpoints
 
 - `GET /health`
 - `GET /.well-known/agent-card.json`
-- `POST /oauth/token` for OAuth 2.0 client credentials token issuance
+- `GET /.well-known/openid-configuration` for OIDC/OAuth discovery testing
+- `GET /oauth/authorize` for OAuth 2.0 authorization-code-with-PKCE callback testing
+- `POST /oauth/token` for OAuth 2.0 client credentials or authorization-code token issuance
 - `POST /` for JSON-RPC methods
 - `POST /message:send` for HTTP+JSON style `SendMessageRequest`
 - `POST /message:stream` for HTTP+JSON SSE streaming
@@ -16,6 +18,27 @@ A small FastAPI A2A test agent backed by Google Gemini. It has a public Agent Ca
 - `POST /tasks/{taskId}:subscribe` for SSE subscription to a non-terminal task
 
 The Agent Card and health endpoint are public. Invoke and task endpoints require the auth mode configured by `A2A_AUTH_MODE`.
+
+## Supported Auth Modes
+
+Set `A2A_AUTH_MODE` to one of these values:
+
+| Mode | Agent Card scheme | Invocation credential |
+| --- | --- | --- |
+| `none` | No security requirement | No auth header or parameter |
+| `basic` | `httpAuthSecurityScheme`, `Basic` | `Authorization: Basic ...` |
+| `bearer_token` | `httpAuthSecurityScheme`, `Bearer` | `Authorization: Bearer <token>` |
+| `api_key_header` | `apiKeySecurityScheme`, `header` | Header named by `A2A_API_KEY_NAME` |
+| `api_key_query` | `apiKeySecurityScheme`, `query` | Query parameter named by `A2A_API_KEY_NAME` |
+| `api_key_cookie` | `apiKeySecurityScheme`, `cookie` | Cookie named by `A2A_API_KEY_NAME` |
+| `oauth2` | OAuth 2.0 client credentials flow | Bearer token from `/oauth/token` |
+| `oauth2_authorization_code_pkce` | OAuth 2.0 authorization code + PKCE | Bearer token from `/oauth/token` |
+| `oauth2_device_code` | OAuth 2.0 device code flow | Bearer token from `/oauth/token` |
+| `oidc` | OpenID Connect discovery | Static bearer token for this test fixture |
+| `mtls` | Mutual TLS | `X-Client-Cert-Fingerprint` header for Render testing |
+
+`mtls` is a Render-compatible simulation. Render terminates TLS before the FastAPI app, so the app cannot validate a real client TLS certificate directly.
+Deprecated OAuth implicit and password flows are not implemented.
 
 ## JSON-RPC Methods
 
@@ -45,20 +68,79 @@ pip install -r requirements.txt
 export GOOGLE_API_KEY='<your-google-api-key>'
 export GEMINI_MODEL='gemini-3.5-flash'
 export A2A_AUTH_MODE='basic'
-export A2A_BASIC_USERNAME='rismohan'
-export A2A_BASIC_PASSWORD='Welcome@123'
+export A2A_BASIC_USERNAME='<your-basic-username>'
+export A2A_BASIC_PASSWORD='<your-basic-password>'
 export PUBLIC_BASE_URL='http://localhost:8080'
 uvicorn main:app --host 0.0.0.0 --port 8080
 ```
+
+For no-auth local testing:
+
+```bash
+export A2A_AUTH_MODE='none'
+```
+
+For bearer-token local testing:
+
+```bash
+export A2A_AUTH_MODE='bearer_token'
+export A2A_BEARER_TOKEN='<your-bearer-token>'
+```
+
+For API key local testing:
+
+```bash
+export A2A_AUTH_MODE='api_key_header'
+export A2A_API_KEY_NAME='X-API-Key'
+export A2A_API_KEY_VALUE='<your-api-key>'
+```
+
+Use `api_key_query` or `api_key_cookie` for query parameter or cookie based API key testing.
 
 For OAuth 2.0 local testing:
 
 ```bash
 export A2A_AUTH_MODE='oauth2'
 export A2A_OAUTH_CLIENT_ID='a2a_client'
-export A2A_OAUTH_CLIENT_SECRET='Welcome@123'
+export A2A_OAUTH_CLIENT_SECRET='<your-client-secret>'
 export A2A_OAUTH_SCOPE='a2a.invoke'
 export A2A_OAUTH_TOKEN_SIGNING_SECRET='change-this-signing-secret'
+```
+
+For 3-legged OAuth 2.0 callback validation with PKCE:
+
+```bash
+export A2A_AUTH_MODE='oauth2_authorization_code_pkce'
+export A2A_OAUTH_CLIENT_ID='a2a_client'
+export A2A_OAUTH_SCOPE='a2a.invoke'
+export A2A_OAUTH_TOKEN_SIGNING_SECRET='change-this-signing-secret'
+export A2A_OAUTH_ALLOWED_REDIRECT_URIS='http://localhost:8080/v2/mcpGateway/auth/callback,http://localhost:8080/v2/mcpGateway/contentIntelligence/auth/callback'
+export A2A_OAUTH_CODE_TTL_SECONDS='300'
+```
+
+For OIDC Agent Card discovery testing:
+
+```bash
+export A2A_AUTH_MODE='oidc'
+export A2A_BEARER_TOKEN='<your-bearer-token>'
+export A2A_OIDC_DISCOVERY_URL='https://<your-render-service>.onrender.com/.well-known/openid-configuration'
+```
+
+For OAuth 2.0 device-code flow testing:
+
+```bash
+export A2A_AUTH_MODE='oauth2_device_code'
+export A2A_OAUTH_CLIENT_ID='a2a_client'
+export A2A_OAUTH_SCOPE='a2a.invoke'
+export A2A_OAUTH_TOKEN_SIGNING_SECRET='change-this-signing-secret'
+export A2A_OAUTH_DEVICE_CODE_TTL_SECONDS='600'
+```
+
+For mTLS Agent Card testing on Render:
+
+```bash
+export A2A_AUTH_MODE='mtls'
+export A2A_MTLS_CLIENT_CERT_FINGERPRINT='<your-client-cert-fingerprint>'
 ```
 
 ## Render Deployment
@@ -77,11 +159,45 @@ PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
 GOOGLE_API_KEY=<your-google-api-key>
 GEMINI_MODEL=gemini-3.5-flash
 A2A_AUTH_MODE=basic
-A2A_BASIC_USERNAME=rismohan
-A2A_BASIC_PASSWORD=Welcome@123
+A2A_BASIC_USERNAME=<your-basic-username>
+A2A_BASIC_PASSWORD=<your-basic-password>
 ```
 
 Do not put `GOOGLE_API_KEY` in the Agent Card or connector metadata.
+
+### Render Auth Mode Configuration
+
+Use one `A2A_AUTH_MODE` per deployment when testing connector auth mapping.
+
+```text
+# no auth
+A2A_AUTH_MODE=none
+
+# bearer token
+A2A_AUTH_MODE=bearer_token
+A2A_BEARER_TOKEN=<your-bearer-token>
+
+# API key in header/query/cookie
+A2A_AUTH_MODE=api_key_header
+A2A_API_KEY_NAME=X-API-Key
+A2A_API_KEY_VALUE=<your-api-key>
+
+# OIDC discovery, with static bearer enforcement in this test fixture
+A2A_AUTH_MODE=oidc
+A2A_BEARER_TOKEN=<your-bearer-token>
+A2A_OIDC_DISCOVERY_URL=https://<your-render-service>.onrender.com/.well-known/openid-configuration
+
+# OAuth 2.0 device code
+A2A_AUTH_MODE=oauth2_device_code
+A2A_OAUTH_CLIENT_ID=a2a_client
+A2A_OAUTH_SCOPE=a2a.invoke
+A2A_OAUTH_TOKEN_SIGNING_SECRET=<long-random-signing-secret>
+A2A_OAUTH_DEVICE_CODE_TTL_SECONDS=600
+
+# mTLS Agent Card scheme, simulated behind Render
+A2A_AUTH_MODE=mtls
+A2A_MTLS_CLIENT_CERT_FINGERPRINT=<your-client-cert-fingerprint>
+```
 
 ### Render OAuth 2.0 Configuration
 
@@ -128,6 +244,47 @@ The gateway should fetch the token from `/oauth/token` and call the A2A invoke/t
 Authorization: Bearer <access_token>
 ```
 
+### Render OAuth 2.0 Authorization Code With PKCE Configuration
+
+To test 3-legged OAuth callback validation, set these Render environment variables:
+
+```text
+PUBLIC_BASE_URL=https://<your-render-service>.onrender.com
+GOOGLE_API_KEY=<your-google-api-key>
+GEMINI_MODEL=gemini-3.5-flash
+A2A_AUTH_MODE=oauth2_authorization_code_pkce
+A2A_OAUTH_CLIENT_ID=a2a_client
+A2A_OAUTH_SCOPE=a2a.invoke
+A2A_OAUTH_TOKEN_SIGNING_SECRET=<long-random-signing-secret>
+A2A_OAUTH_TOKEN_TTL_SECONDS=3600
+A2A_OAUTH_CODE_TTL_SECONDS=300
+A2A_OAUTH_ALLOWED_REDIRECT_URIS=https://<gateway-host>/v2/mcpGateway/auth/callback,https://<gateway-host>/v2/mcpGateway/contentIntelligence/auth/callback
+```
+
+When `A2A_AUTH_MODE=oauth2_authorization_code_pkce`, the public Agent Card advertises:
+
+```text
+authorizationUrl=https://<your-render-service>.onrender.com/oauth/authorize
+tokenUrl=https://<your-render-service>.onrender.com/oauth/token
+scope=a2a.invoke
+```
+
+In the connector UI/config, use an OAuth authorization-code PKCE profile. The gateway should generate the callback URL and PKCE verifier/challenge:
+
+```json
+{
+  "authentication": {
+    "selectedAuthProfile": "oauth2_authorization_code_pkce",
+    "authorizationUrl": "https://<your-render-service>.onrender.com/oauth/authorize",
+    "tokenUri": "https://<your-render-service>.onrender.com/oauth/token",
+    "clientId": "a2a_client",
+    "oauthScopes": "a2a.invoke"
+  }
+}
+```
+
+The test agent validates the callback URL by exact string match against `A2A_OAUTH_ALLOWED_REDIRECT_URIS`. Add the gateway callback URL used by your environment before starting the Render service.
+
 ## Direct Curl Tests
 
 Fetch the public Agent Card:
@@ -152,17 +309,89 @@ TOKEN=$(curl -s -X POST 'https://<your-render-service>.onrender.com/oauth/token'
   | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 ```
 
-For OAuth mode, replace each `--user 'rismohan:Welcome@123'` example below with:
+Fetch an OAuth 2.0 authorization-code token manually with PKCE:
+
+```bash
+export CODE_VERIFIER='test-verifier-1234567890'
+CODE_CHALLENGE=$(python -c 'import base64,hashlib,os; v=os.environ["CODE_VERIFIER"].encode("ascii"); print(base64.urlsafe_b64encode(hashlib.sha256(v).digest()).decode("ascii").rstrip("="))')
+
+curl -iG 'https://<your-render-service>.onrender.com/oauth/authorize' \
+  --data-urlencode 'response_type=code' \
+  --data-urlencode 'client_id=a2a_client' \
+  --data-urlencode 'redirect_uri=https://<gateway-host>/v2/mcpGateway/auth/callback' \
+  --data-urlencode 'scope=a2a.invoke' \
+  --data-urlencode 'state=manual-state-1' \
+  --data-urlencode "code_challenge=$CODE_CHALLENGE" \
+  --data-urlencode 'code_challenge_method=S256'
+
+TOKEN=$(curl -s -X POST 'https://<your-render-service>.onrender.com/oauth/token' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=authorization_code' \
+  --data-urlencode 'client_id=a2a_client' \
+  --data-urlencode 'redirect_uri=https://<gateway-host>/v2/mcpGateway/auth/callback' \
+  --data-urlencode 'code=<code-from-redirect>' \
+  --data-urlencode "code_verifier=$CODE_VERIFIER" \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+Fetch an OAuth 2.0 device-code token:
+
+```bash
+DEVICE_CODE=$(curl -s -X POST 'https://<your-render-service>.onrender.com/oauth/device_authorize' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'client_id=a2a_client' \
+  --data-urlencode 'scope=a2a.invoke' \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["device_code"])')
+
+TOKEN=$(curl -s -X POST 'https://<your-render-service>.onrender.com/oauth/token' \
+  --header 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'grant_type=urn:ietf:params:oauth:grant-type:device_code' \
+  --data-urlencode 'client_id=a2a_client' \
+  --data-urlencode "device_code=$DEVICE_CODE" \
+  | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+```
+
+For OAuth mode, replace each `--user '<your-basic-username>:<your-basic-password>'` example below with:
 
 ```bash
 --header "Authorization: Bearer $TOKEN"
+```
+
+For bearer-token or OIDC mode, use:
+
+```bash
+--header "Authorization: Bearer <your-bearer-token>"
+```
+
+For API key header mode, use:
+
+```bash
+--header "X-API-Key: <your-api-key>"
+```
+
+For API key query mode, append the configured query parameter:
+
+```bash
+?X-API-Key=<your-api-key>
+```
+
+For API key cookie mode, use:
+
+```bash
+--cookie "X-API-Key=<your-api-key>"
+```
+
+For mTLS simulation mode on Render, use:
+
+```bash
+--header "X-Client-Cert-Fingerprint: <your-client-cert-fingerprint>"
 ```
 
 Create a Gemini-backed task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -180,7 +409,7 @@ Create the same task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -203,7 +432,7 @@ Create a non-terminal async task:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -221,7 +450,7 @@ Create a non-terminal async task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -244,7 +473,7 @@ Create a streamed Gemini-backed task:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/message:stream' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/a2a+json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -263,7 +492,7 @@ Create a streamed Gemini-backed task through JSON-RPC:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -287,14 +516,14 @@ Use the returned `task.id` and `task.contextId` for task lifecycle calls:
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks/<task-id>' \
-  --user 'rismohan:Welcome@123'
+  --user '<your-basic-username>:<your-basic-password>'
 ```
 
 Subscribe to a non-terminal task and complete it:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:subscribe' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Accept: text/event-stream'
 ```
 
@@ -302,7 +531,7 @@ Poll a task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -318,7 +547,7 @@ Subscribe to a non-terminal task through JSON-RPC:
 
 ```bash
 curl -N -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --header 'Accept: text/event-stream' \
   --data '{
@@ -333,14 +562,14 @@ curl -N -X POST 'https://<your-render-service>.onrender.com/' \
 
 ```bash
 curl 'https://<your-render-service>.onrender.com/tasks?contextId=<context-id>' \
-  --user 'rismohan:Welcome@123'
+  --user '<your-basic-username>:<your-basic-password>'
 ```
 
 List tasks through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -354,7 +583,7 @@ curl -X POST 'https://<your-render-service>.onrender.com/' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/a2a+json' \
   --data '{
     "metadata": {"skillId": "llm_chat"},
@@ -372,14 +601,14 @@ curl -X POST 'https://<your-render-service>.onrender.com/message:send' \
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/tasks/<task-id>:cancel' \
-  --user 'rismohan:Welcome@123'
+  --user '<your-basic-username>:<your-basic-password>'
 ```
 
 Cancel a task through JSON-RPC:
 
 ```bash
 curl -X POST 'https://<your-render-service>.onrender.com/' \
-  --user 'rismohan:Welcome@123' \
+  --user '<your-basic-username>:<your-basic-password>' \
   --header 'Content-Type: application/json' \
   --data '{
     "jsonrpc": "2.0",
@@ -418,8 +647,8 @@ Store auth in connector config or vault:
   },
   "authentication": {
     "selectedAuthProfile": "basic_profile",
-    "username": "rismohan",
-    "password": "Welcome@123"
+    "username": "<your-basic-username>",
+    "password": "<your-basic-password>"
   }
 }
 ```
