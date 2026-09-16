@@ -352,7 +352,7 @@ def agent_card() -> Dict[str, Any]:
         "skills": [
             {
                 "id": "llm_chat",
-                "name": "LLM Chat",
+                "name": "LLM_Chat",
                 "description": "Uses Gemini to answer general user requests.",
                 "tags": ["llm", "chat", "gemini"],
                 "examples": [
@@ -365,7 +365,7 @@ def agent_card() -> Dict[str, Any]:
             },
             {
                 "id": "llm_summarize",
-                "name": "LLM Summarize",
+                "name": "LLM_Summarize",
                 "description": "Uses Gemini to summarize text into concise bullets.",
                 "tags": ["llm", "summary", "gemini"],
                 "examples": [
@@ -378,7 +378,7 @@ def agent_card() -> Dict[str, Any]:
             },
             {
                 "id": "llm_extract_actions",
-                "name": "LLM Extract Actions",
+                "name": "LLM_Extract_Actions",
                 "description": "Uses Gemini to extract action items, owners, and dates from text.",
                 "tags": ["llm", "actions", "gemini"],
                 "examples": [
